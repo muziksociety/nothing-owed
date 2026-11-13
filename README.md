@@ -176,7 +176,7 @@ Three lessons from putting the package into a real Telegram bot that sends rende
     .catch(() => chat.send(id, 'Sorry, the render failed. Try again later.'));
   ```
 
-  If you only learn later that the user was told, call `noteJobUserNotified(jobId)`: a report still waiting is skipped, and one already being written is dropped before `deliver()` (event `report_dropped`).
+  If you only learn later that the user was told, call `noteJobUserNotified(jobId)`: a report still waiting is skipped, and one already being written, waiting for a retry, or kept as a missed notice is dropped before `deliver()` (event `report_dropped`). It returns `false` when nothing about the job is still open. `true` does not promise that nothing was sent: a text already inside `deliver()` when you call it still goes out. Called on a job that is still open, the flag is stored; if that job is then lost in a restart, its "interrupted by a restart" report is skipped too, since you said you would tell the user how it ended.
 
 Try it without an API key (a fake model on a virtual clock; every run prints exactly this):
 

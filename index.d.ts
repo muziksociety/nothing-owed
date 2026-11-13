@@ -509,8 +509,11 @@ export interface NothingOwed {
   /**
    * The host told the user itself how this job ended. Open job: its finishJob runs no report turn.
    * Report still waiting: skipped (report_skipped). Report turn running, or report waiting for a
-   * delivery retry: its text is dropped before deliver() (report_dropped). False when nothing about
-   * the job is still open.
+   * delivery retry or as a missed notice: its text is dropped before deliver() (report_dropped).
+   * False when nothing about the job is still open. True does not promise nothing was sent: a
+   * text already inside deliver() when you call this still goes out.
+   * The flag on an open job is stored: if that job is then lost in a restart, its "interrupted by
+   * a restart" report is skipped too.
    */
   noteJobUserNotified(jobId: string): boolean;
   /** Loads the store (notes made earlier are merged), takes its lock, arms the timer. */

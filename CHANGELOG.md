@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-11-13
+
+From a review of the 0.5.0 change.
+
+### Fixed
+
+- A report turn that answered with a `DUE` line after `noteJobUserNotified` had its text dropped,
+  but the text was still stored as a dated check and could reach the user later. It no longer is.
+- A report turn that failed after `noteJobUserNotified` waited a full recheck delay (with a
+  `report_retry` event) before it was skipped, and parked checks waited with it. It now ends at
+  once with `report_skipped` (`user_notified`) and `report_done`.
+- `finishJob(..., { userNotified: true })` now emits `report_done`, like every other report path.
+- `noteJobUserNotified` also drops a job report that was given up on and kept as a missed notice.
+  Missed entries of job reports now store `jobId` and `kind`; older entries without them still
+  load.
+
+### Changed
+
+- A `userNotifiedOnError` callback that throws now emits an `error` event (stage
+  `userNotifiedOnError`) instead of failing silently. The job still counts as not notified, and
+  `wrapJob` still rethrows the job's own error.
+
+### Docs
+
+- `noteJobUserNotified`: `true` does not promise nothing was sent (a text already inside
+  `deliver()` still goes out); a flagged open job that is lost in a restart skips its restart
+  report.
+
 ## [0.5.0] - 2026-11-13
 
 Lessons from putting the package into a Telegram bot that sends rendered media to its users.
