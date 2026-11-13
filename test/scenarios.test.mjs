@@ -82,9 +82,14 @@ test('(a) 30-minute non-stop chat: the promise from minute 2 is in the check at 
   assert.equal(s.no.messageCount(C), 61, '60 chat messages plus the delivered chart');
 });
 
-test('(b) two promises, one done and one running: first item at 5, second at the next check', async () => {
+test('(b) two promises, one done and one running: first item at 5, second at the next check, one verify', async () => {
   const s = scenario({
-    model: (_p, ctx) => (ctx.recheck === 0 ? 'Here is the outline.\nThe full draft is still being written.\nSTILL_RUNNING' : 'Here is the full draft.'),
+    model: (prompt) => {
+      const got = deliveredPart(prompt);
+      if (got.includes('Here is the full draft')) return 'NOTHING_OWED';
+      if (got.includes('Here is the outline')) return 'Here is the full draft.';
+      return 'Here is the outline.\nThe full draft is still being written.\nSTILL_RUNNING';
+    },
   });
   await s.build();
   s.user();
@@ -94,7 +99,8 @@ test('(b) two promises, one done and one running: first item at 5, second at the
     { min: 5, text: 'Here is the outline.\nThe full draft is still being written.' },
     { min: 10, text: 'Here is the full draft.' },
   ]);
-  assert.deepEqual(s.wakes.map((x) => x.min), [5, 10]);
+  // 15: the verify check on the draft it just delivered finds nothing new
+  assert.deepEqual(s.wakes.map((x) => x.min), [5, 10, 15]);
 });
 
 test('(c) 1-hour tracked job: parked at 5, no wakes until it ends at 60, then one report and one check', async () => {
@@ -140,6 +146,7 @@ test('(e) restart mid-window and mid-park: nothing lost, the counter continues',
   const path = join(mkdtempSync(join(tmpdir(), 'nothing-owed-')), 'state.json');
   const s = scenario({
     store: createFileStore(path),
+    extra: { onStartJobs: (jobs) => jobs.map((j) => j.id) }, // the host still runs its jobs after a restart
     model: (prompt, ctx) => {
       if (ctx.kind === 'report') return 'The import finished: 300 rows.';
       if (prompt.includes('send the list') && !deliveredPart(prompt).includes('Here is the list')) return 'Here is the list: a, b, c.';
@@ -192,16 +199,17 @@ test('(f) tracked job that never finishes: a status at 2 hours, then the check e
   assert.equal(s.no.parked().length, 0);
 });
 
-test('(g) delivery fails twice and lands on attempt 3; the model is woken once', async () => {
+test('(g) delivery fails twice and lands on attempt 3; the model writes once, then one verify', async () => {
   const s = scenario({
-    model: () => 'Here is the report I promised.',
+    model: (prompt) => (deliveredPart(prompt).includes('Here is the report') ? 'NOTHING_OWED' : 'Here is the report I promised.'),
     failSend: (n, text) => text.startsWith('Here is the report') && n <= 2, // the first two sends fail
   });
   await s.build();
   s.user();
   s.agent("I'll send the report.");
   await s.to(30);
-  assert.deepEqual(s.wakes, [{ min: 5, kind: 'check' }]);
+  assert.deepEqual(s.wakes, [{ min: 5, kind: 'check' }, { min: 20, kind: 'check' }]);
+  assert.equal(s.turns[1].ctx.reason, 'verify');
   assert.deepEqual(s.got, [{ min: 15, text: 'Here is the report I promised.' }]);
   assert.deepEqual(s.events.filter((e) => e.type === 'delivery_retry').map((e) => e.attempt), [1, 2]);
   assert.equal(s.events.find((e) => e.type === 'delivery_recovered').attempt, 3);

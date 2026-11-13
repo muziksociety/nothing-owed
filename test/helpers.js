@@ -13,6 +13,7 @@ export function world({ reply = 'NOTHING_OWED', store = createMemoryStore(), ...
     reply,
     turns: [], // { conversationId, prompt }
     sent: [], // { conversationId, text }
+    metas: [], // the third deliver() argument, in send order
     events: [],
     timers: [],
     store,
@@ -34,22 +35,24 @@ export function world({ reply = 'NOTHING_OWED', store = createMemoryStore(), ...
         w.turns.push({ conversationId, prompt, ctx });
         return typeof w.reply === 'function' ? w.reply(conversationId, prompt, ctx) : w.reply;
       },
-      deliver: async (conversationId, text) => {
+      deliver: async (conversationId, text, meta) => {
         w.sent.push({ conversationId, text });
+        w.metas.push(meta);
       },
       onEvent: (e) => w.events.push(e),
       ...opts,
       ...extra,
     });
-  // Move the clock and fire any timer that came due, then let the checks finish.
-  w.advance = async (ms) => {
+  // Move the clock and fire any timer that came due, then let the checks finish. With
+  // { wait: false } it does not wait for running turns (for turns that never settle).
+  w.advance = async (ms, { wait = true } = {}) => {
     w.t += ms;
     for (;;) {
       const due = w.timers.filter((h) => h.at <= w.t);
       if (!due.length) break;
       w.timers = w.timers.filter((h) => !due.includes(h));
       for (const h of due) h.fn();
-      await w.no.idle();
+      if (wait) await w.no.idle();
       await new Promise((r) => setImmediate(r));
     }
   };

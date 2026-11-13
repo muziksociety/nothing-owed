@@ -96,7 +96,9 @@ test('STILL_RUNNING is capped: the last check asks for a one-line status', async
   assert.equal(w.no.pending().length, 0, 'no endless rechecks');
   await w.advance(DELAY * 10);
   assert.equal(w.turns.length, 7);
-  assert.deepEqual(w.sent, []);
+  // the model gave no status line: code tells the user plainly it is no longer watched
+  assert.equal(w.sent.length, 1);
+  assert.match(w.sent[0].text, /no longer watching it/);
 });
 
 test('the last check delivers its one-line status', async () => {
@@ -108,7 +110,7 @@ test('the last check delivers its one-line status', async () => {
   assert.deepEqual(w.sent.map((s) => s.text), ['The export is still running and will report.']);
 });
 
-test('a check reply never schedules a new check', async () => {
+test('a check reply gets one verify check, and a repeat of it ends the chain', async () => {
   const w = world({ reply: 'Delivering it now: the file is ready.' });
   // A host that routes every outgoing message through noteReply, including the check's own.
   w.no = w.make({
@@ -121,15 +123,19 @@ test('a check reply never schedules a new check', async () => {
   w.no.noteReply(C, 'x');
   await w.advance(DELAY);
   assert.equal(w.sent.length, 1);
-  assert.equal(w.no.pending().length, 0);
+  assert.equal(w.no.pending().length, 1, 'the package verify only');
   await w.advance(DELAY * 3);
-  assert.equal(w.turns.length, 1);
+  assert.equal(w.turns.length, 2, 'the verify saw the same text again: nothing new, chain ends');
+  assert.equal(w.sent.length, 1);
 });
 
-test('replies marked check, report or system never schedule', async () => {
+test('replies marked system never schedule; check and report get a verify check', async () => {
   const w = await started();
-  for (const kind of ['check', 'report', 'system']) assert.equal(w.no.noteReply(C, 'x', { kind }), null);
+  assert.equal(w.no.noteReply(C, 'x', { kind: 'system' }), null);
   assert.equal(w.no.pending().length, 0);
+  assert.equal(w.no.noteReply(C, 'x', { kind: 'check' }).kind, 'verify');
+  assert.equal(w.no.noteReply(C, 'y', { kind: 'report' }).replies.length, 2);
+  assert.equal(w.no.pending().length, 1);
   assert.ok(w.no.noteReply(C, 'x', { kind: 'reply' }));
 });
 
@@ -165,7 +171,7 @@ test('a reply that arrives while a check yields merges into it, older replies fi
   assert.equal(w.turns.length, 1);
 });
 
-test('failed check turns are silent', async () => {
+test('failed check turns are silent to the user and come back later', async () => {
   const w = world({
     reply: () => {
       throw new Error('model offline');
@@ -178,7 +184,8 @@ test('failed check turns are silent', async () => {
   assert.deepEqual(w.sent, []);
   assert.ok(w.types().includes('failed'));
   assert.ok(w.events.some((e) => e.type === 'error' && e.stage === 'check'));
-  assert.equal(w.no.pending().length, 0);
+  assert.equal(w.no.pending().length, 1);
+  assert.equal(w.no.pending()[0].rechecks, 1);
 });
 
 test('empty answers and canned failure notices are silent', async () => {

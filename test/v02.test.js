@@ -96,10 +96,10 @@ test('user messages and replies count; each reply gets a seq', async () => {
   const rec = w.no.noteReply(C, 'promise');
   assert.equal(rec.replies[0].seq, 2);
   w.no.noteUserMessage(C);
-  w.no.noteReply(C, 'x', { kind: 'check' }); // the user saw it: counts, not listed
+  w.no.noteReply(C, 'x', { kind: 'check' }); // the user saw it: counts, joins as a verify reply
   w.no.noteReply(C, 'y', { kind: 'system' }); // not a message the user saw
   assert.equal(w.no.messageCount(C), 4);
-  assert.equal(w.no.pending()[0].replies.length, 1);
+  assert.deepEqual(w.no.pending()[0].replies.map((r) => [r.text, r.seq]), [['promise', 2], ['x', 4]]);
 });
 
 test('the prompt shows how many messages back each reply is, and the lookup line', async () => {
@@ -160,18 +160,20 @@ test('deliver_running delivers the text and requeues the same record delayMs lat
   assert.equal(p.length, 1);
   assert.equal(p[0].rechecks, 1);
   assert.equal(p[0].due, w.t + FIVE);
-  assert.deepEqual(p[0].replies.map((r) => r.text), ['I will send A and B.']);
+  assert.deepEqual(p[0].replies.map((r) => r.text), ['I will send A and B.', 'Here is A.'], 'the delivered part joins as a verify reply');
   assert.ok(w.events.some((e) => e.type === 'delivered' && e.stillRunning === true));
 });
 
 test('on the last check the marker is stripped and nothing is requeued', async () => {
-  const w = await five({ reply: 'Status: B still running.\nSTILL_RUNNING' }, { maxRechecks: 1, backoffMs: [] });
+  const w = await five({ reply: (_c, _p, ctx) => (ctx.isLastCheck ? 'Status: B still running.\nSTILL_RUNNING' : 'A is here.\nSTILL_RUNNING') }, { maxRechecks: 1, backoffMs: [] });
   w.no.noteReply(C, 'x');
   await w.advance(FIVE);
   await w.advance(FIVE);
   assert.equal(w.turns.length, 2);
-  assert.deepEqual(w.sent.map((s) => s.text), ['Status: B still running.', 'Status: B still running.']);
-  assert.equal(w.no.pending().length, 0);
+  assert.deepEqual(w.sent.map((s) => s.text), ['A is here.', 'Status: B still running.']);
+  assert.equal(w.no.pending().length, 0, 'nothing requeued, no verify after a last check');
+  await w.advance(FIVE * 4);
+  assert.equal(w.turns.length, 2);
 });
 
 // ---- 5. job tracking ----------------------------------------------------------------------
@@ -217,7 +219,7 @@ test('finishJob runs one report turn, delivers it, then the parked check runs on
   assert.deepEqual(w.no.jobs(), []);
 });
 
-test('a report reply routed back through noteReply never schedules a check', async () => {
+test('a report reply routed back through noteReply is not counted twice and adds no check', async () => {
   const w = world({ reply: 'Report: done.' });
   w.no = w.make({
     delayMs: FIVE,
@@ -230,7 +232,8 @@ test('a report reply routed back through noteReply never schedules a check', asy
   w.no.trackJob(C, 'j', { title: 't' });
   await w.no.finishJob('j', { status: 'done', text: 'ok' });
   assert.equal(w.sent.length, 1);
-  assert.equal(w.no.pending().length, 0);
+  assert.equal(w.no.pending().length, 1, 'only the package verify');
+  assert.deepEqual(w.no.pending()[0].replies.map((r) => r.text), ['Report: done.']);
   assert.equal(w.no.messageCount(C), 1);
 });
 
@@ -329,7 +332,7 @@ test('a v0.1 store file (a plain array) still loads', async () => {
   await w.advance(FIVE);
   assert.match(w.turns[0].prompt, /1\. \(\d{4}-[^)]*Z\) "old reply"/);
   const saved = JSON.parse(readFileSync(path, 'utf8'));
-  assert.equal(saved.version, 2);
+  assert.equal(saved.version, 3);
 });
 
 test('counters, open jobs and parked checks survive a restart', async () => {
@@ -343,7 +346,7 @@ test('counters, open jobs and parked checks survive a restart', async () => {
   await w.advance(FIVE);
   w.no.stop();
   w.timers = [];
-  w.no = w.make({ delayMs: FIVE });
+  w.no = w.make({ delayMs: FIVE, onStartJobs: (jobs) => jobs.map((j) => j.id) }); // the host still runs it
   await w.no.start();
   assert.equal(w.no.messageCount(C), 2);
   assert.deepEqual(w.no.jobs().map((j) => j.id), ['j']);
@@ -404,7 +407,7 @@ test('a restart continues the back-off ladder', async () => {
   assert.deepEqual(mins.slice(-2), [50, 80]);
 });
 
-test('check replies and report replies never schedule a new check', async () => {
+test('check replies and report replies get one verify check between them; nothing loops', async () => {
   const w = world({ reply: (_c, _p, ctx) => (ctx.kind === 'report' ? 'Report: the job is done.' : 'Here is what I owed.') });
   // A host that routes every outgoing message through noteReply, including the package's own.
   w.no = w.make({
@@ -418,15 +421,17 @@ test('check replies and report replies never schedule a new check', async () => 
   w.no.noteReply(C, 'promise');
   await w.advance(FIVE);
   assert.equal(w.sent.length, 1);
-  assert.equal(w.no.pending().length, 0, 'check reply did not schedule');
+  assert.equal(w.no.pending().length, 1, 'one verify, no window from the echo');
   w.no.trackJob(C, 'j', { title: 'job' });
   await w.no.finishJob('j', { status: 'done', text: 'ok' });
   assert.equal(w.sent.length, 2);
-  assert.equal(w.no.pending().length, 0, 'report reply did not schedule');
-  // A host that delivers them itself and marks the kind.
-  assert.equal(w.no.noteReply(C, 'a check reply', { kind: 'check' }), null);
-  assert.equal(w.no.noteReply(C, 'a report', { kind: 'report' }), null);
-  assert.equal(w.no.pending().length, 0);
+  assert.equal(w.no.pending().length, 1, 'the report joins the same verify');
+  // A host that delivers them itself and marks the kind: they join it too.
+  w.no.noteReply(C, 'a check reply', { kind: 'check' });
+  w.no.noteReply(C, 'a report', { kind: 'report' });
+  assert.equal(w.no.pending().length, 1);
+  assert.equal(w.no.pending()[0].replies.length, 4);
   await w.advance(FIVE * 6);
-  assert.equal(w.turns.length, 2, 'one check, one report, nothing else');
+  assert.equal(w.turns.length, 3, 'one check, one report, one verify (a repeat, so nothing new), nothing else');
+  assert.equal(w.sent.length, 2);
 });

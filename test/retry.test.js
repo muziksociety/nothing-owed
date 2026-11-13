@@ -79,7 +79,7 @@ test('isPermanentError stops retrying at once', async () => {
   assert.equal(w.attempts.length, 1);
 });
 
-test('gives up after maxDeliveryAttempts, then sends one Missed line before the next delivery', async () => {
+test('gives up after maxDeliveryAttempts; the fresh check sends the full Missed line once, and no copy', async () => {
   const long = 'L'.repeat(200);
   const w = await setup({ reply: long, failures: (n) => n <= 3, maxDeliveryAttempts: 3 });
   w.no.noteReply(C, 'x');
@@ -89,15 +89,14 @@ test('gives up after maxDeliveryAttempts, then sends one Missed line before the 
   assert.equal(w.attempts.length, 3);
   assert.ok(w.types().includes('delivery_failed'));
   assert.equal(w.no.outbox().length, 0);
+  await w.advance(FIVE); // the fresh check: the Missed line first; the model's copy is a duplicate
+  assert.deepEqual(w.sent.map((s) => s.text), [`Missed: ${long}`]);
+  assert.ok(w.types().includes('duplicate_skipped'));
   await w.advance(FIVE * 3);
-  assert.equal(w.attempts.length, 3, 'no more attempts');
   w.reply = 'Next item.';
   w.no.noteReply(C, 'y');
   await w.advance(FIVE);
-  assert.deepEqual(w.sent.map((s) => s.text), [`Missed: ${'L'.repeat(120)}`, 'Next item.']);
-  w.no.noteReply(C, 'z');
-  await w.advance(FIVE);
-  assert.deepEqual(w.sent.map((s) => s.text).slice(2), ['Next item.'], 'the Missed line goes once');
+  assert.deepEqual(w.sent.map((s) => s.text).slice(1), ['Next item.'], 'the Missed line goes once');
 });
 
 test('failed job reports are retried too', async () => {

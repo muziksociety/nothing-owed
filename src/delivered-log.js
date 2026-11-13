@@ -5,13 +5,14 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+const SAME_MS = 60 * 1000;
 const clip = (s, max) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 
 /**
  * @param {object} [opts]
  * @param {string} [opts.path]          persist to this JSON file (default: memory only)
  * @param {number} [opts.maxPerConversation=400]
- * @param {number} [opts.maxAgeMs=172800000] drop entries older than this (default 2 days)
+ * @param {number} [opts.maxAgeMs=172800000] drop entries, and whole idle conversations, older than this (default 2 days)
  * @param {number} [opts.maxTextLength=2000]
  * @param {() => number} [opts.now]
  */
@@ -38,6 +39,12 @@ export function createDeliveredLog({
     return kept.length > maxPerConversation ? kept.slice(-maxPerConversation) : kept;
   };
 
+  // Forget conversations whose newest entry is older than maxAgeMs.
+  const pruneIdle = () => {
+    const cut = now() - maxAgeMs;
+    for (const [k, arr] of byConv) if (!arr.length || arr[arr.length - 1].last < cut) byConv.delete(k);
+  };
+
   const persist = () => {
     if (!path) return;
     mkdirSync(dirname(path), { recursive: true });
@@ -60,14 +67,19 @@ export function createDeliveredLog({
       const arr = byConv.get(key) || [];
       const body = clip(text, maxTextLength);
       let entry = id != null ? arr.findLast((e) => e.id === id) : undefined;
+      // The same text noted twice within a minute is one delivery noted by two layers (for
+      // example the host's transport log and the scheduler's own record of its deliveries).
+      if (!entry) entry = arr.findLast((e) => e.text === body && Math.abs(t - e.last) <= SAME_MS && (id == null || e.id == null));
       if (entry) {
         entry.text = body;
-        entry.last = t;
+        entry.last = Math.max(entry.last, t);
+        if (id != null && entry.id == null) entry.id = id;
       } else {
         entry = { id: id ?? null, at: t, last: t, text: body };
         arr.push(entry);
       }
       byConv.set(key, prune(arr));
+      pruneIdle();
       persist();
       return { at: entry.at, text: entry.text };
     },

@@ -1,7 +1,7 @@
-// Stores keep the scheduler state across restarts: pending and parked checks, message counters,
-// open tracked jobs and deliveries waiting for a retry. A store is { load(), save(state) }; either
-// may return a promise. The scheduler always saves the whole state object. A store that still
-// holds a v0.1 plain array of checks loads fine.
+// Stores keep the scheduler state across restarts: pending, parked and dated checks, owed report
+// turns, message counters, open tracked jobs, deliveries waiting for a retry, missed notices and
+// today's turn counts. A store is { load(), save(state) }; either may return a promise. The
+// scheduler always saves the whole state object. v0.1 (a plain array) and v0.2 stores load fine.
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
