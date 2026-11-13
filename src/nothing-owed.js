@@ -574,8 +574,8 @@ export function createNothingOwed(options = {}) {
       if (dropped) return { ok: false, dropped: true };
       return { ok: true, ids, text: sentText, skipped: !!skipped };
     } catch (error) {
-      const item = { id: newId('out', now()), conversationId: cid, text, attempts: 1, due: 0, at: now(), ...meta };
       if (drop?.()) return { ok: false, dropped: true };
+      const item = { id: newId('out', now()), conversationId: cid, text, attempts: 1, due: 0, at: now(), ...meta };
       failDelivery(item, error);
       return { ok: false };
     }

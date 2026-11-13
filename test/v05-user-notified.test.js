@@ -240,3 +240,21 @@ test('scenario control: the same timeline without userNotified sends a second fa
   await w.advance(120 * MIN);
   assert.equal(got.length, 3, 'the report turn wrote its own failure message');
 });
+
+test('deliver() fails after noteJobUserNotified: no outbox retry, one report_dropped', async () => {
+  const w = world({ reply: 'The render failed.' });
+  w.no = w.make({
+    delayMs: FIVE,
+    deliver: async () => {
+      w.no.noteJobUserNotified('j'); // the host tells the user while this send is on its way
+      throw new Error('platform down');
+    },
+  });
+  await w.no.start();
+  w.no.trackJob(C, 'j');
+  await w.no.finishJob('j', { status: 'error', text: 'x' });
+  await w.no.idle();
+  assert.deepEqual(w.no.outbox(), []);
+  assert.deepEqual(ev(w, 'report_dropped').map((e) => [e.jobId, e.kind]), [['j', 'report']]);
+  assert.ok(!w.types().includes('delivery_retry'));
+});
