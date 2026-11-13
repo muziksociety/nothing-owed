@@ -1,5 +1,6 @@
 // A dropped promise caught, then a long job tracked. No API key, no network: the "model" is
-// a tiny fake, and 100 ms stands in for one minute.
+// a tiny fake, and the minutes are virtual (the scheduler takes an injected clock), so every run
+// prints exactly the same lines and takes a fraction of a second.
 //
 //   node examples/simulate.mjs
 //
@@ -16,10 +17,28 @@
 import { createNothingOwed } from 'nothing-owed';
 
 const CHAT = 'chat-42';
-const MINUTE = 100; // ms
-const t0 = Date.now();
-const log = (who, msg) => console.log(`[min ${String(((Date.now() - t0) / MINUTE).toFixed(1)).padStart(5)}] ${who.padEnd(6)} ${msg}`);
-const sleep = (minutes) => new Promise((r) => setTimeout(r, minutes * MINUTE));
+const MINUTE = 60 * 1000;
+
+// ---- a virtual clock: the scheduler's timers fire as the script moves time forward --------
+let clock = 0;
+let timers = [];
+const now = () => clock;
+const setTimer = (fn, ms) => { const h = { fn, at: clock + ms }; timers.push(h); return h; };
+const clearTimer = (h) => { timers = timers.filter((x) => x !== h); };
+async function sleep(minutes) {
+  const end = clock + minutes * MINUTE;
+  for (;;) {
+    const next = timers.filter((h) => h.at <= end).sort((a, b) => a.at - b.at)[0];
+    if (!next) break;
+    clock = Math.max(clock, next.at);
+    timers = timers.filter((h) => h !== next);
+    next.fn();
+    await owed.idle();
+    await new Promise((r) => setImmediate(r));
+  }
+  clock = end;
+}
+const log = (who, msg) => console.log(`[min ${String((clock / MINUTE).toFixed(1)).padStart(5)}] ${who.padEnd(6)} ${msg}`);
 
 // ---- a fake agent with a memory of its own conversation ---------------------------------
 const memory = []; // everything the agent wrote, delivered or not
@@ -60,7 +79,7 @@ function userSays(text) {
 }
 
 owed = createNothingOwed({
-  delayMs: 5 * MINUTE, // the default is 5 real minutes
+  now, setTimer, clearTimer, // the virtual clock; the defaults are used for everything else (delayMs: 5 min)
   runTurn: async (conversationId, prompt, ctx) => {
     wakes++;
     if (ctx.kind === 'report') {
@@ -99,7 +118,7 @@ await owed.idle();
 // ---- part 2: a tracked long job ----------------------------------------------------------
 userSays('Now render the full video, please.');
 agentSays('Starting the render. It takes a while; I will report when it is done.');
-const render = owed.wrapJob(CHAT, 'render-1', sleep(20).then(() => '4 clips, 2.1 GB'), { title: 'render' });
+const render = owed.wrapJob(CHAT, 'render-1', () => sleep(20).then(() => '4 clips, 2.1 GB'), { title: 'render' });
 await render;
 await owed.idle();
 await sleep(5.5); // the verify check on the report

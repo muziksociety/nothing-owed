@@ -70,6 +70,8 @@ export interface TrackedJob {
 }
 
 export interface FinishedJob extends TrackedJob {
+  /** The line the code-written report uses (wrapJob sets it from the result's text or summary). */
+  summary?: string;
   /** 'lost' when the job was found in the store at start() and not kept by onStartJobs. */
   status: 'done' | 'error' | 'stopped' | 'lost' | string;
   text: string;
@@ -230,6 +232,7 @@ export type NothingOwedEvent =
   | { type: 'due_limit'; at: number; conversationId: string; checkId: string | null; dueDepth: number; dated: number }
   | { type: 'missed_retry'; at: number; conversationId: string; retryInMs: number; error: unknown }
   | { type: 'report_done'; at: number; conversationId: string; jobId: string }
+  | { type: 'report_skipped'; at: number; conversationId: string; jobId: string; reason: 'host_replied' }
   | { type: 'turn_timeout'; at: number; conversationId: string; kind: 'check' | 'report'; checkId?: string | null; jobId?: string | null }
   | { type: 'nothing_owed'; at: number; conversationId: string; checkId: string; ms: number }
   | { type: 'still_running'; at: number; conversationId: string; checkId: string; recheck: number; ms: number }
@@ -311,6 +314,9 @@ export interface BuildPromptInput {
 
 export interface BuildReportPromptInput {
   job: { id: string; title?: string; status?: string; text?: string };
+  /** What reached the user since the job ended (if it already has the result, the agent answers NOTHING_OWED). */
+  delivered?: TimedText[];
+  maxDelivered?: number;
   userLabel?: string;
   /** Bound the job's output to this many characters (head and tail). Default 1500. */
   maxTextLength?: number;
@@ -375,8 +381,8 @@ export interface NothingOwedOptions {
   idlePruneMs?: number;
   /** State writes are batched this long; stop() writes at once. Default 100. 0 writes on every change. */
   saveDebounceMs?: number;
-  /** IANA zone of your users, for the "Now:" line of the prompt. Default: UTC only. */
-  timeZone?: string;
+  /** IANA zone of your users for the "Now:" line of the prompt, or a function of the conversation. Default: UTC only. */
+  timeZone?: string | ((conversationId: string) => string | undefined);
   /** Wait between delivery retries. Default 300000 (5 min). An error's retryAfterMs overrides one wait. */
   retryMs?: number;
   /** Delivery attempts before giving up. Default 12. */
@@ -452,7 +458,7 @@ export interface NothingOwed {
   isChecking(conversationId: string): boolean;
   trackJob(conversationId: string, jobId: string, opts?: { title?: string }): TrackedJob;
   /** Resolves at once with the finished job (null for an unknown job). The report runs in the background: watch report_delivered, report_fallback, report_done. */
-  finishJob(jobId: string, opts?: { status?: 'done' | 'error' | 'stopped' | 'lost' | string; text?: string }): Promise<FinishedJob | null>;
+  finishJob(jobId: string, opts?: { status?: 'done' | 'error' | 'stopped' | 'lost' | string; text?: string; summary?: string }): Promise<FinishedJob | null>;
   /** trackJob, await the work, finishJob with its result or error message, return the result (or rethrow). */
   wrapJob<T>(conversationId: string, jobId: string, work: Promise<T> | (() => Promise<T> | T), opts?: { title?: string }): Promise<T>;
   /** Loads the store (notes made earlier are merged), takes its lock, arms the timer. */

@@ -80,6 +80,8 @@ deliver() throws or times out
 
 **The package reads its own replies back.** Every package delivery schedules one verify check, carrying a depth; past `maxVerifyDepth` the user gets one "no longer watched" line a day. No verify after a last-check status, nor after a delivery that also set a `DUE` timer: the timer is the follow-up, and doing both turned "content + DUE every few minutes" into a branching tree of 57 messages a day.
 
+**DUE times are read as UTC.** The prompt asks for UTC, so a time without a zone, with a space instead of `T`, or with `UTC`/`GMT` is read as UTC rather than rejected (a zoneless reminder used to fall through to the 4-hour ladder and a "no longer watched" line). An explicit offset is kept.
+
 **Dated promises get a timer in code, with limits.** `DUE <UTC time>` stores a timer; at that time a check runs with the replies that made the promise. Chains of `DUE` answers stop at `maxDueDepth` (10) and a conversation holds at most 5 timers; past that, one code-written line a day. A model answering "DUE in six minutes" forever used to cost 240 turns over three days.
 
 **The duplicate guard is narrow on purpose.** An exact copy of something queued, given up on, or delivered since this check last ran (or in the last 10 minutes) is not sent. It used to compare with everything since the window start, which dropped a daily reminder on days 2 to 5 and the second of two identical "backup finished" reports. Dated checks are never compared; reports only against the same job.
@@ -92,6 +94,10 @@ deliver() throws or times out
 
 **Jobs are tracked in code, not in the model.** A `running` answer with an open job checks once more, then parks: no wakes until the job ends. One recheck first, because the job may not be the only thing owed.
 
+**A report stays quiet when the host already answered.** Hosts often send the job's result themselves (`const result = await wrapJob(...)`). The report prompt lists what reached the user since the job ended; if the host noted a reply after the job ended and the report turn answers `NOTHING_OWED`, nothing more is sent. The code-written report never shows raw JSON: an object result gives its `text` or `summary`, or just "<title> <status>.".
+
+**A normal reply starts a new verify chain.** Verify depth counts package replies in a row. A normal reply that joins a verify record resets it to 0, so a long normal chat where each window delivers something never hits the cap and its "no longer watching" line.
+
 **A report is owed until it is delivered or replaced.** A finished job becomes a stored report record: it waits for `isUserBusy`, retries on the check ladder, falls back to `<title> <status>: <first line of output>`, and is marked delivered in the store right before the send, so a crash after the send never repeats it with new wording. `finishJob` and `wrapJob` resolve at once; events say when the report is done.
 
 **Jobs do not survive a restart unless the host says so.** A job in the store at `start()` finishes as `lost` through the normal report path, unless `onStartJobs(jobs)` keeps it.
@@ -102,7 +108,7 @@ deliver() throws or times out
 
 **Bounds for scale.** Turn slots grow with the backlog (2, plus one per 25 waiting, up to 8): 300 conversations due at once used to wait 43 minutes for the median check; with 30-second turns it is now about 15. Counters of conversations idle for 30 days are pruned. A user who stays "busy" for 30 minutes produces one `busy_stuck` event; the check keeps waiting rather than interrupt.
 
-**User turns win, and the host can enforce it.** `runTurn` resumes the same session as the user's turns, so the two must not run at once, and `runTurn` must not post anything itself. `isUserBusy` makes checks wait; `onTurnStart`, `onTurnEnd` and `isChecking()` let the host serialize turns for certain.
+**User turns win, and the host enforces it.** `runTurn` resumes the same session as the user's turns, so the two must not run at once, and `runTurn` must not post anything itself. `isUserBusy` makes checks wait politely, but it is sampled before the turn, so it cannot close every race. The quick start and examples put user turns and `runTurn` through one queue per conversation; that is the guarantee. `onTurnStart`, `onTurnEnd` and `isChecking()` are there for hosts that serialize another way.
 
 **The delivered list comes from the host.** The model's context contains what it wrote, including text that never left the process. The only reliable record of what the user saw is the transport's success log. The prompt also says what file entries such as `[photo]` mean, that this turn cannot send files, and never to claim a send that is not in the list.
 

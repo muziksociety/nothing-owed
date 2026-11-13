@@ -101,40 +101,60 @@ npm install nothing-owed
 ```js
 import { createNothingOwed, createFileStore } from 'nothing-owed';
 
+// One queue per conversation, used by user turns AND check turns: two turns never run on the
+// same session at once.
+const queues = new Map();
+function inQueue(id, fn) {
+  const next = (queues.get(id) ?? Promise.resolve()).then(fn, fn);
+  queues.set(id, next.catch(() => {}));
+  return next;
+}
+const busy = new Set(); // conversations with a user turn in progress
+
 const owed = createNothingOwed({
   store: createFileStore('./data/pending-checks.json'), // also keeps the delivered log, and a lock file
-  runTurn: (conversationId, prompt, ctx) => agent.resume(conversationId, prompt, { signal: ctx.signal }), // same session
-  deliver: (conversationId, text) => chat.send(conversationId, text), // throw if the platform did not confirm
-  isUserBusy: (conversationId) => turnsInFlight.has(conversationId) || owed.isChecking(conversationId),
-  timeZone: 'Europe/Madrid', // optional: the prompt shows the users' local time too
+  runTurn: (id, prompt, ctx) => inQueue(id, () => agent.resume(id, prompt, { signal: ctx.signal })), // same session
+  deliver: (id, text) => chat.send(id, text), // throw if the platform did not confirm
+  isUserBusy: (id) => busy.has(id),
+  timeZone: 'Europe/Madrid', // optional: the users' local time in the prompt (or (id) => zone)
 });
 await owed.start();
 
-// wherever the user writes to the agent:
-owed.noteUserMessage('chat-42');       // counts messages, so the check can say "8 messages back"
+// your user-turn handler:
+async function onUserMessage(id, userText) {
+  owed.noteUserMessage(id);                // counts messages, so the check can say "8 messages back"
+  busy.add(id);
+  try {
+    const text = await inQueue(id, () => agent.resume(id, userText));
+    for (const line of owed.flushMissed(id)) await chat.send(id, line); // owed "Missed:" notices first
+    await chat.send(id, text);
+    owed.noteDelivered(id, text);          // it really reached the user
+    owed.noteReply(id, text);              // the agent replied: opens (or joins) the check window
+  } finally {
+    busy.delete(id);
+  }
+}
 
-// wherever your host sends the agent's reply to the user:
-for (const line of owed.flushMissed('chat-42')) await chat.send('chat-42', line); // owed "Missed:" notices first
-owed.noteDelivered('chat-42', text);   // it really reached the user
-owed.noteReply('chat-42', text);       // the agent replied: opens (or joins) the check window
-
-// wherever the agent starts long work for that conversation:
+// wherever the agent starts long work for a conversation:
 const result = await owed.wrapJob('chat-42', 'render-17', renderVideo(), { title: 'render' });
+// If you send `result` yourself, the report turn sees it and stays quiet.
 
 // on shutdown:
-await owed.stop();                     // writes the final state
+await owed.stop();                         // writes the final state
 ```
 
 Two rules for `runTurn`:
 
-- **Serialize it with your user turns.** A check turn resumes the same session as the user's turns. Do not run both at once: use `isUserBusy`, `onTurnStart` / `onTurnEnd` and `isChecking(id)` to keep them apart.
+- **Serialize it with your user turns.** A check turn resumes the same session as the user's turns. Do not run both at once: put both through one queue per conversation, as above. `isUserBusy` only makes the check wait politely; the queue is what guarantees it. (`onTurnStart` / `onTurnEnd` and `isChecking(id)` are there if you serialize another way.) A check queued behind a long user turn counts toward `turnTimeoutMs`.
 - **It must not send anything itself.** It returns the agent's text; the package decides whether it goes to the user and sends it through `deliver()`. If your agent runtime posts its replies to the chat on its own, turn that off for these turns.
 
 What the package sends through `deliver()` it counts and logs as delivered itself. If your send path also calls `noteDelivered` or `noteReply` for those messages, that is fine: the same text within a minute is one entry, and the package recognizes its own deliveries coming back through `noteReply`. `deliver()` gets a third argument, `{ kind, checkId, jobId }`, if you want to tell them apart.
 
 **One process per store.** The file store writes `<path>.lock` with its process id and refuses a second live process. Two processes on one store would overwrite each other's state.
 
-Try it without an API key:
+**Keep the process alive.** The scheduler's timers are unref'd: they never keep Node running on their own. In a bot or server, the polling loop or the open port does that; in a script, keep something alive (or the checks never fire).
+
+Try it without an API key (a fake model on a virtual clock; every run prints exactly this):
 
 ```sh
 node examples/simulate.mjs
@@ -142,29 +162,29 @@ node examples/simulate.mjs
 
 ```text
 [min   0.0] user   "Can you summarize this video? https://example.com/v/123"
-[min   0.1] host   -> user: "Got it. I'll send the summary when it's done."
-[min   0.1] timer  check window opened: fires in 5 min, later replies will not move it
-[min   1.1] agent  wrote the summary in a background turn... but nothing sent it (dropped)
-[min   5.1] check  fires; the agent audits its conversation (its first reply: 1 message back)
-[min   5.1] host   -> user: "SUMMARY: three points: setup, demo, pricing. Verdict: worth a watch."
-[min   5.1] check  owed item delivered
-[min   5.1] timer  verify check in 5 min on what was just delivered
-[min   5.6] user   "Now render the full video, please."
-[min   5.6] host   -> user: "Starting the render. It takes a while; I will report when it is done."
-[min   5.6] job    tracked: render
-[min  10.1] check  fires; the agent audits its conversation (its first reply: 3 messages back)
-[min  10.1] check  STILL_RUNNING
-[min  15.2] check  fires; the agent audits its conversation (its first reply: 3 messages back)
-[min  15.2] check  STILL_RUNNING
-[min  15.2] check  an open job: parked on render-1, no wakes until it ends
-[min  25.6] job    finished: done
-[min  25.6] report the job ended; one report turn
-[min  25.6] host   -> user: "Render finished: 4 clips, 2.1 GB. Nothing else is open."
-[min  25.6] timer  verify check in 5 min on what was just delivered
-[min  25.6] check  unparked: runs once now
-[min  25.6] check  fires; the agent audits its conversation (its first reply: 4 messages back)
-[min  25.6] check  NOTHING_OWED: nothing sent
-[min  31.1] done   one dropped promise caught, one long job reported; 5 model wakes in total
+[min   0.0] host   -> user: "Got it. I'll send the summary when it's done."
+[min   0.0] timer  check window opened: fires in 5 min, later replies will not move it
+[min   1.0] agent  wrote the summary in a background turn... but nothing sent it (dropped)
+[min   5.0] check  fires; the agent audits its conversation (its first reply: 1 message back)
+[min   5.0] host   -> user: "SUMMARY: three points: setup, demo, pricing. Verdict: worth a watch."
+[min   5.0] check  owed item delivered
+[min   5.0] timer  verify check in 5 min on what was just delivered
+[min   5.5] user   "Now render the full video, please."
+[min   5.5] host   -> user: "Starting the render. It takes a while; I will report when it is done."
+[min   5.5] job    tracked: render
+[min  10.0] check  fires; the agent audits its conversation (its first reply: 3 messages back)
+[min  10.0] check  STILL_RUNNING
+[min  15.0] check  fires; the agent audits its conversation (its first reply: 3 messages back)
+[min  15.0] check  STILL_RUNNING
+[min  15.0] check  an open job: parked on render-1, no wakes until it ends
+[min  25.5] job    finished: done
+[min  25.5] report the job ended; one report turn
+[min  25.5] host   -> user: "Render finished: 4 clips, 2.1 GB. Nothing else is open."
+[min  25.5] timer  verify check in 5 min on what was just delivered
+[min  25.5] check  unparked: runs once now
+[min  25.5] check  fires; the agent audits its conversation (its first reply: 4 messages back)
+[min  25.5] check  NOTHING_OWED: nothing sent
+[min  31.0] done   one dropped promise caught, one long job reported; 5 model wakes in total
 ```
 
 ## How it works
@@ -189,7 +209,7 @@ The full prompt is in [`src/outcome.js`](./src/outcome.js). Override it with `bu
 | `NOTHING_OWED` | Nothing is sent. The check ends. |
 | `STILL_RUNNING` | The only debt is background work that will report on its own. Nothing is sent. With an open tracked job the check comes back once more `delayMs` later, then parks until the job ends (see Long jobs). Without one it comes back `delayMs` later, `maxRechecks` (6) times, then backs off by `backoffMs` (15, 30, 60, 120 minutes). The final step asks for a one-line status that says plainly the work is no longer watched. |
 | text, plus a `STILL_RUNNING` line | Part of the debt is ready, part is still running. The text (minus the marker) goes to the user, and the check comes back for the rest. |
-| `DUE <UTC time ending in Z>`, alone or after text | A promise for a later time. Any text goes out now; a dated timer is stored, and at that time a check runs with the replies that made the promise. With `STILL_RUNNING` too, both happen. Times in the past or more than `maxDueMs` (30 days) away count as `STILL_RUNNING`. A chain of `DUE` answers stops after `maxDueDepth` (10), and a conversation holds at most 5 dated timers; past either, a code-written line. |
+| `DUE <UTC time>`, alone or after text | A promise for a later time. Any text goes out now; a dated timer is stored, and at that time a check runs with the replies that made the promise. With `STILL_RUNNING` too, both happen. Times in the past or more than `maxDueMs` (30 days) away count as `STILL_RUNNING`. A chain of `DUE` answers stops after `maxDueDepth` (10), and a conversation holds at most 5 dated timers; past either, a code-written line. |
 | anything else | It is the owed content. It goes to the user through `deliver()`, unless it is a word-for-word copy of something queued, given up on, or delivered since this check last ran (or in the last 10 minutes). Dated checks are never compared, so a daily reminder goes out every day. |
 | empty, `...`, a `failTexts` entry, tool-call markup, an error, or a timeout | Nothing is sent now; the check comes back on the same ladder. If the last step still fails, the user gets the `giveUpText` line, *"I may have said I'd follow up on something, and I couldn't check it. Ask me if anything is still open."*, at most once per conversation per outage, and never while the circuit breaker is open (then the step waits for it to close). |
 
@@ -198,8 +218,8 @@ If the last check answers only `STILL_RUNNING`, code sends a line too, saying th
 Parsing is strict about what it sends and loose about how markers look:
 
 - Markers count on the first line or among the last two lines, in any case, with quotes, bold, code marks, code fences, punctuation, a `Status:` label or a short note around them: `` `NOTHING_OWED` ``, `**Nothing owed.**`, `STILL_RUNNING (render)`. All marker lines are removed from what is sent.
-- `DUE` is upper-case only and needs an ISO time with a zone (`Z` or an offset); it may sit in `<...>` and carry a short note. Any other `DUE` line counts as `STILL_RUNNING`. "Due 12 May..." in a sentence stays text.
-- A last-line `NOTHING_OWED` means nothing is sent (what came before was reasoning). A first-line `NOTHING_OWED` with real content after it, or `NOTHING_OWED except ...`, delivers that content.
+- `DUE` is upper-case only and needs a date and a time (`T` or a space between them). No zone, `Z`, `UTC` or `GMT` all mean UTC, as the prompt asks; an explicit offset (`+01:00`) is kept. It may sit in `<...>` and carry a short note. Any other `DUE` line counts as `STILL_RUNNING`. "Due 12 May..." in a sentence stays text.
+- A last-line `NOTHING_OWED` means nothing is sent (what came before was reasoning). A first-line `NOTHING_OWED` followed by one short plain remark is still nothing; followed by real content (more than one sentence, a link, "except", "but", "however"), or `NOTHING_OWED except ...`, it delivers that content. Brackets and emoji around markers are ignored.
 - A reply whose last sentence holds `NOTHING_OWED`, or is a short "nothing is owed" with no numbers in it, is nothing. `NOTHING_OWED` and `STILL_RUNNING` together keep the check open.
 - A `STILL_RUNNING` inside a sentence is sent as "still running" and the check stays open. `<think>` blocks are removed. The same parser reads job reports.
 
@@ -216,8 +236,8 @@ const output = await owed.wrapJob(conversationId, jobId, renderVideo(), { title:
 ```
 
 - A check that answers `STILL_RUNNING` while the conversation has an open tracked job comes back once more, then **parks** on it. No model wakes while parked. A *failed* check never parks: it takes the ladder, so an unrelated open job cannot delay a promise.
-- `finishJob` and `wrapJob` resolve at once. In the background, the package queues **one report turn** in the same session (job title, status, its output, "tell the user what it produced and what is still open"). The report is stored, waits while the user is mid-turn, and a failed report turn is retried on the same ladder as a check. It is marked delivered in the store right before it is sent, so a crash after the send never sends it twice. Events tell you when it is done: `report_delivered`, `report_fallback`, `report_done`.
-- If the report turn keeps failing, answers `NOTHING_OWED` or only `STILL_RUNNING`, or the circuit breaker says the model is down, the user gets a **code-written report**: `<title> <status>: <first line of the output, up to 300 characters>`.
+- `finishJob` and `wrapJob` resolve at once. In the background, the package queues **one report turn** in the same session (job title, status, its output, the messages delivered since the job ended, "tell the user what it produced and what is still open"). If you already sent the result yourself and noted it with `noteReply`, the report turn sees it, answers `NOTHING_OWED`, and nothing more is sent. The report is stored, waits while the user is mid-turn, and a failed report turn is retried on the same ladder as a check. It is marked delivered in the store right before it is sent, so a crash after the send never sends it twice. Events tell you when it is done: `report_delivered`, `report_fallback`, `report_done`.
+- If the report turn keeps failing, answers `NOTHING_OWED` (with no reply of yours since the job ended) or only `STILL_RUNNING`, or the circuit breaker says the model is down, the user gets a **code-written report**: `<title> <status>: <first line, up to 300 characters>`. For an object result that line is its `text` or `summary`, never raw JSON; without either it is just `<title> <status>.`
 - Pass `onJobFinished(conversationId, job)` to deliver the result yourself instead. Note what you send with `noteReply(id, text, { kind: 'report' })` so it gets its verify check.
 - Then the parked check runs once, in case something else was owed. A check parked on two jobs waits for both.
 - **Safety net:** a check parked longer than `jobTimeoutMs` (2 hours) runs once with the last-check prompt, so the user gets a one-line status that says plainly it is no longer watched, parks one more period, then ends.
@@ -244,26 +264,34 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 |---|---|---|
 | `runTurn(id, prompt, ctx)` | required | Resume the same conversation's session with `prompt`; return the reply text, or `{ text, usage, costUsd }`. `ctx` has `kind`, `reason`, `isLastCheck` and an abort `signal`. Serialize it with user turns; it must not send anything itself. |
 | `deliver(id, text, meta)` | required | Send a package-made text. `meta` is `{ kind, checkId, jobId }`, kind `check`, `report`, `giveup`, `fallback` or `missed`. Throw if the send was not confirmed. |
-| `getDelivered(id, sinceMs)` | built-in log | Your send log: `[{ at, text }]` for that conversation since `sinceMs`. |
+| `store` | memory | `createFileStore(path)` (keeps the delivered log and a lock file next to it), `createMemoryStore()`, or any `{ load(), save(state) }`. |
 | `isUserBusy(id)` | none | `true` while the user is mid-conversation; checks and reports wait `busyRetryMs` and try again. |
-| `onTurnStart(id, ctx)`, `onTurnEnd(id, ctx)` | none | Called around every model turn, so you can serialize them with user turns. |
-| `store` | memory | `createFileStore(path)`, `createMemoryStore()`, or any `{ load(), save(state) }` (optional `saveSync`, `lock`, `unlock`, `deliveredBacking`). |
-| `timeZone` | UTC only | IANA zone of your users, for the "Now:" line. |
+| `getDelivered(id, sinceMs)` | built-in log | Your own send log: `[{ at, text }]` for that conversation since `sinceMs`. |
+| `timeZone` | UTC only | IANA zone of your users for the "Now:" line, or `(id) => zone`. |
 | `delayMs` | `300000` (5 min) | The check is due this long after the first reply of a window. Also the recheck and verify delay. |
+| `onJobFinished(id, job)` | report turn | Deliver a finished job's result yourself instead of the report turn. |
+| `onStartJobs(jobs)` | keep none | Jobs found in the store at `start()`: return the ids your host still runs; the rest finish as `lost`. |
+| `giveUpText(ctx)` | built-in lines | The code-written lines; `ctx.reason` is `failed`, `still_running`, `verify_capped`, `daily_cap` (with `until`) or `due_limit`. |
+| `dailyCap` | `60` | Model turns per conversation per UTC day (`0` disables). |
+| `onEvent(event)`, `onUsage(info)` | none | Every event (see `index.d.ts`), and turn usage or cost. |
+
+<details>
+<summary>Advanced options</summary>
+
+| Option | Default | Meaning |
+|---|---|---|
+| `onTurnStart(id, ctx)`, `onTurnEnd(id, ctx)` | none | Called around every model turn, if you serialize turns another way than one queue. |
 | `maxRechecks` | `6` | Timed rechecks at `delayMs` after `STILL_RUNNING` or a failed turn. |
 | `backoffMs` | `[15, 30, 60, 120]` min | Further recheck steps after those; the last asks for a one-line status. `[]` disables. |
-| `giveUpText(ctx)` | built-in lines | The code-written lines; `ctx.reason` is `failed`, `still_running`, `verify_capped`, `daily_cap` (with `until`) or `due_limit`. |
 | `turnTimeoutMs` | `180000` (3 min) | A turn that does not settle by then counts as failed; `ctx.signal` is aborted. `0` disables. |
 | `callbackTimeoutMs` | `30000` | Timeout for `deliver`, `isUserBusy`, `getDelivered`, `onJobFinished`, `onStartJobs` and the turn hooks. `0` disables. |
 | `isJunk(text)` | tool-call markup | A reply it flags is a failed check, never delivered. The default catches lines starting with `<｜`, and `invoke name=`, `<tool_call`, `<function_calls>`. |
-| `maxVerifyDepth` | `3` | Verify checks in a row. |
+| `maxVerifyDepth` | `3` | Verify checks in a row (a normal reply starts a new chain). |
 | `maxDueMs`, `maxDueDepth`, `maxDatedPerConversation` | 30 days, `10`, `5` | Limits for `DUE`. |
 | `maxConcurrent`, `maxConcurrentLimit` | `2`, `8` | Model turns at once; one more per 25 waiting, up to the limit. |
-| `dailyCap`, `dailyCapReserve`, `globalDailyCap` | `60`, `10`, `1000` | Turn caps per conversation and overall. `0` disables. |
+| `dailyCapReserve`, `globalDailyCap` | `10`, `1000` | Turns of `dailyCap` kept for window and dated checks; turns per day overall (`0` disables). |
 | `circuitFailures`, `circuitPauseMs`, `circuitMaxPauseMs` | `5`, 15 min, 2 h | The circuit breaker. `circuitFailures: 0` disables it. |
 | `jobTimeoutMs` | `7200000` (2 h) | A check parked on jobs this long gets one status check, then one more period, then ends. |
-| `onJobFinished(id, job)` | report turn | Deliver a finished job's result yourself. |
-| `onStartJobs(jobs)` | keep none | Jobs found in the store at `start()`: return the ids your host still runs. |
 | `retryMs`, `maxDeliveryAttempts` | 5 min, `12` | Delivery retries. |
 | `missedRetryMs`, `missedMaxRetryMs` | 15 min, 6 h | The missed-notice timer. |
 | `isPermanentError(err)` | never | `true` stops retrying at once. |
@@ -272,12 +300,13 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 | `maxReplies`, `maxTextLength`, `maxDeliveredInPrompt`, `maxReportLength` | `12`, `300`, `40`, `1500` | Prompt bounds. |
 | `saveDebounceMs`, `idlePruneMs` | 100 ms, 30 days | Batched writes; counters of conversations idle this long are dropped. |
 | `userLabel`, `failTexts` | `"the user"`, `[]` | How the prompt names the user; canned error notices treated as failures. |
-| `onEvent(event)`, `onUsage(info)` | none | Every event (see `index.d.ts`), and turn usage or cost. |
 | `buildPrompt`, `buildReportPrompt`, `parseOutcome` | built-in | Replace the prompts or the parser. |
 | `deliveredLog` | with the store | `createDeliveredLog({ path })` to keep it elsewhere. |
 | `now`, `setTimer`, `clearTimer` | real clock | Inject for tests. |
 
-Methods: `noteReply(id, text, { kind? })`, `noteUserMessage(id)`, `messageCount(id)`, `noteDelivered(id, text, at | { at, id })`, `flushMissed(id)`, `isChecking(id)`, `trackJob(id, jobId, { title })`, `finishJob(jobId, { status, text })`, `wrapJob(id, jobId, promiseOrFn, { title })`, `start()`, `stop()`, `flush()`, `tick()`, `idle()`, `pending()`, `parked()`, `dated()`, `jobs()`, `reports()`, `outbox()`, `missed()`, `circuit()`.
+</details>
+
+Methods: `noteReply(id, text, { kind? })`, `noteUserMessage(id)`, `messageCount(id)`, `noteDelivered(id, text, at | { at, id })`, `flushMissed(id)`, `isChecking(id)`, `trackJob(id, jobId, { title })`, `finishJob(jobId, { status, text, summary })`, `wrapJob(id, jobId, promiseOrFn, { title })`, `start()`, `stop()`, `flush()`, `tick()`, `idle()`, `pending()`, `parked()`, `dated()`, `jobs()`, `reports()`, `outbox()`, `missed()`, `circuit()`.
 
 `noteReply` kinds: none or `reply` opens or joins a window; `check` and `report` (replies you delivered yourself) count and get one verify check; `giveup`, `fallback` and `missed` only count; `system` does neither.
 
@@ -328,7 +357,7 @@ Honest note: v0.1 waited for the conversation to go quiet, and that was cheaper:
 
 **Can it loop?** Every chain has a cap, and the tests drive each one to its end on a fake clock: rechecks (`maxRechecks` plus the back-off steps), verify checks (`maxVerifyDepth`), `DUE` chains (`maxDueDepth`, 5 timers per conversation), parked checks (`jobTimeoutMs` plus one period), delivery retries (`maxDeliveryAttempts`), missed notices (doubling to 6 hours), and turns per conversation and overall per day. A word-for-word repeat of something just sent is not sent again.
 
-**What if the user is talking to the agent when the check fires?** Pass `isUserBusy`. Checks and report turns wait and retry; your user's turns go first. A reply sent meanwhile joins the check. For a hard guarantee, serialize with `onTurnStart` / `onTurnEnd` and `isChecking`.
+**What if the user is talking to the agent when the check fires?** Pass `isUserBusy`: checks and report turns wait and retry, and a reply sent meanwhile joins the check. For a hard guarantee, run user turns and `runTurn` through one queue per conversation, as in the quick start.
 
 **Does the agent need tools during the check?** Not to judge. If it owes a result it can only produce with tools, let `runTurn` allow them, but keep the turn short: the prompt tells it not to sleep or poll, `turnTimeoutMs` ends it after 3 minutes, and it cannot send files from this turn (the prompt says so).
 

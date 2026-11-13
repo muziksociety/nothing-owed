@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-11-13
+
+From a review of normal day-to-day flows.
+
+### Changed
+
+- `DUE` times without a zone, with a space instead of `T`, or with `UTC`/`GMT` are read as UTC (the
+  prompt asks for UTC); explicit offsets are kept. They used to count as `STILL_RUNNING`.
+- The report prompt lists what reached the user since the job ended. If the host noted a reply
+  after the job ended and the report turn answers `NOTHING_OWED`, nothing is sent (event
+  `report_skipped`); before, a fallback with the raw result followed the host's own message.
+- The code-written report never shows raw JSON: the result's `text` or `summary`, else
+  `<title> <status>.` (`finishJob` takes `summary`; `wrapJob` sets it).
+- A first-line `NOTHING_OWED` followed by one short plain sentence is nothing; brackets and emoji
+  around markers are ignored (`[STILL_RUNNING]` was sent as "[still running]").
+- A normal reply joining a verify record resets its depth, so a normal chat never hits the verify
+  cap.
+- `timeZone` may be a function of the conversation.
+- The quick start and the grammY and Agent SDK examples put user turns and `runTurn` through one
+  queue per conversation; `isUserBusy` no longer uses `isChecking`. The README says the timers are
+  unref'd, keeps the main option table short (the rest under "Advanced options"), and its
+  simulation sample is the exact output of every run (the simulation now runs on a virtual clock).
+
 ## [0.4.0] - 2026-11-13
 
 Fixes from a second independent review and from a replay of the v0.3 prompt on two real models.
