@@ -81,7 +81,7 @@ test('STILL_RUNNING sends nothing and rechecks later until the work reports', as
 
 test('STILL_RUNNING is capped: the last check asks for a one-line status', async () => {
   const w = world({ reply: 'STILL_RUNNING' });
-  w.no = w.make({ maxRechecks: 6 });
+  w.no = w.make({ maxRechecks: 6, backoffMs: [] });
   await w.no.start();
   w.no.noteReply(C, 'job will report');
   for (let i = 0; i < 6; i++) await w.advance(DELAY);
@@ -101,7 +101,7 @@ test('STILL_RUNNING is capped: the last check asks for a one-line status', async
 
 test('the last check delivers its one-line status', async () => {
   const w = world({ reply: (_c, _p, ctx) => (ctx.isLastCheck ? 'The export is still running and will report.' : 'STILL_RUNNING') });
-  w.no = w.make({ maxRechecks: 2 });
+  w.no = w.make({ maxRechecks: 2, backoffMs: [] });
   await w.no.start();
   w.no.noteReply(C, 'job will report');
   for (let i = 0; i < 3; i++) await w.advance(DELAY);

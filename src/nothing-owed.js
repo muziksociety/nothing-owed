@@ -27,6 +27,7 @@ export function createNothingOwed(options = {}) {
   const {
     delayMs = 5 * 60 * 1000,
     maxRechecks = 6,
+    backoffMs = [15, 30, 60, 120].map((m) => m * 60 * 1000),
     busyRetryMs = 60 * 1000,
     deliveredLookbackMs = 10 * 60 * 1000,
     maxReplies = 12,
@@ -61,6 +62,10 @@ export function createNothingOwed(options = {}) {
 
   if (typeof runTurn !== 'function') throw new TypeError('nothing-owed: runTurn(conversationId, prompt) is required');
   if (typeof deliver !== 'function') throw new TypeError('nothing-owed: deliver(conversationId, text) is required');
+
+  // Timed rechecks: maxRechecks at delayMs, then one per back-off step. The last one asks for a status.
+  const totalRechecks = maxRechecks + backoffMs.length;
+  const recheckDelay = (done) => (done < maxRechecks ? delayMs : backoffMs[done - maxRechecks]);
 
   const deliveredLog = options.deliveredLog || createDeliveredLog({ now });
   const readDelivered = getDelivered || ((id, since) => deliveredLog.since(id, since));
@@ -260,8 +265,8 @@ export function createNothingOwed(options = {}) {
         if (open.length) park(rec, open, { timedOut: true });
       } else if (isRunning(outcome) && open.length) {
         park(rec, open);
-      } else if (isRunning(outcome) && rechecks < maxRechecks) {
-        requeue(rec, now() + delayMs, rechecks + 1);
+      } else if (isRunning(outcome) && rechecks < totalRechecks) {
+        requeue(rec, now() + recheckDelay(rechecks), rechecks + 1);
       }
       await save();
       arm();
@@ -278,7 +283,7 @@ export function createNothingOwed(options = {}) {
     }
 
     if (timeout) emit({ type: 'park_timeout', conversationId: cid, checkId: rec.id, jobIds: openJobIds(cid) });
-    const isLastCheck = timeout || (rechecks >= maxRechecks && !openJobIds(cid).length);
+    const isLastCheck = timeout || (rechecks >= totalRechecks && !openJobIds(cid).length);
     let outcome = 'failed';
     let body = '';
     let sent = null;

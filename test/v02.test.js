@@ -165,7 +165,7 @@ test('deliver_running delivers the text and requeues the same record delayMs lat
 });
 
 test('on the last check the marker is stripped and nothing is requeued', async () => {
-  const w = await five({ reply: 'Status: B still running.\nSTILL_RUNNING' }, { maxRechecks: 1 });
+  const w = await five({ reply: 'Status: B still running.\nSTILL_RUNNING' }, { maxRechecks: 1, backoffMs: [] });
   w.no.noteReply(C, 'x');
   await w.advance(FIVE);
   await w.advance(FIVE);
@@ -360,4 +360,73 @@ test('buildReportPrompt names the job, its status and the clipped text', () => {
   assert.match(p, /backup/);
   assert.match(p, /stopped/);
   assert.match(p, /partial/);
+});
+
+// ---- back-off ladder and no re-arm ----------------------------------------------------------
+
+test('after the 5-minute rechecks, running backs off 15, 30, 60, then a final status at 120', async () => {
+  const w = await five({ reply: (_c, _p, ctx) => (ctx.isLastCheck ? 'Still running; it will report.' : 'STILL_RUNNING') });
+  const t0 = w.t;
+  w.no.noteReply(C, 'x');
+  for (let m = 0; m < 300; m++) await w.advance(MIN);
+  const mins = w.events.filter((e) => e.type === 'check_started').map((e) => (e.at - t0) / MIN);
+  assert.deepEqual(mins, [5, 10, 15, 20, 25, 30, 35, 50, 80, 140, 260]);
+  assert.equal(w.turns.at(-1).ctx.isLastCheck, true);
+  assert.equal(w.turns.filter((t) => t.ctx.isLastCheck).length, 1);
+  assert.deepEqual(w.sent.map((s) => s.text), ['Still running; it will report.']);
+  assert.equal(w.no.pending().length, 0);
+});
+
+test('backoffMs is configurable; [] disables the ladder', async () => {
+  const w = await five({ reply: 'STILL_RUNNING' }, { maxRechecks: 1, backoffMs: [2 * MIN] });
+  const t0 = w.t;
+  w.no.noteReply(C, 'x');
+  for (let m = 0; m < 60; m++) await w.advance(MIN);
+  const mins = w.events.filter((e) => e.type === 'check_started').map((e) => (e.at - t0) / MIN);
+  assert.deepEqual(mins, [5, 10, 12]);
+});
+
+test('a restart continues the back-off ladder', async () => {
+  const store = createMemoryStore();
+  const w = world({ store, reply: 'STILL_RUNNING' });
+  const t0 = w.t;
+  w.no = w.make({ delayMs: FIVE });
+  await w.no.start();
+  w.no.noteReply(C, 'x');
+  for (let m = 0; m < 60; m++) await w.advance(MIN); // checks at 5..35 and 50
+  w.no.stop();
+  w.timers = [];
+  w.no = w.make({ delayMs: FIVE });
+  await w.no.start();
+  assert.equal(w.no.pending()[0].rechecks, 8);
+  for (let m = 0; m < 30; m++) await w.advance(MIN);
+  const mins = w.events.filter((e) => e.type === 'check_started').map((e) => (e.at - t0) / MIN);
+  assert.deepEqual(mins.slice(-2), [50, 80]);
+});
+
+test('check replies and report replies never schedule a new check', async () => {
+  const w = world({ reply: (_c, _p, ctx) => (ctx.kind === 'report' ? 'Report: the job is done.' : 'Here is what I owed.') });
+  // A host that routes every outgoing message through noteReply, including the package's own.
+  w.no = w.make({
+    delayMs: FIVE,
+    deliver: async (cid, text) => {
+      w.sent.push({ conversationId: cid, text });
+      w.no.noteReply(cid, text);
+    },
+  });
+  await w.no.start();
+  w.no.noteReply(C, 'promise');
+  await w.advance(FIVE);
+  assert.equal(w.sent.length, 1);
+  assert.equal(w.no.pending().length, 0, 'check reply did not schedule');
+  w.no.trackJob(C, 'j', { title: 'job' });
+  await w.no.finishJob('j', { status: 'done', text: 'ok' });
+  assert.equal(w.sent.length, 2);
+  assert.equal(w.no.pending().length, 0, 'report reply did not schedule');
+  // A host that delivers them itself and marks the kind.
+  assert.equal(w.no.noteReply(C, 'a check reply', { kind: 'check' }), null);
+  assert.equal(w.no.noteReply(C, 'a report', { kind: 'report' }), null);
+  assert.equal(w.no.pending().length, 0);
+  await w.advance(FIVE * 6);
+  assert.equal(w.turns.length, 2, 'one check, one report, nothing else');
 });

@@ -123,9 +123,10 @@ test('(c) 1-hour tracked job: parked at 5, no wakes until it ends at 60, then on
   assert.equal(s.wakes.length, 3);
 });
 
-test('(d) untracked long work: rechecks every 5 minutes up to 6, then one status', async () => {
+test('(d) untracked long work, back-off off: rechecks every 5 minutes up to 6, then one status', async () => {
   const s = scenario({
     model: (_p, ctx) => (ctx.isLastCheck ? 'The upload is still running and will report when done.' : 'STILL_RUNNING'),
+    extra: { backoffMs: [] },
   });
   await s.build();
   s.user();
@@ -204,4 +205,18 @@ test('(g) delivery fails twice and lands on attempt 3; the model is woken once',
   assert.deepEqual(s.got, [{ min: 15, text: 'Here is the report I promised.' }]);
   assert.deepEqual(s.events.filter((e) => e.type === 'delivery_retry').map((e) => e.attempt), [1, 2]);
   assert.equal(s.events.find((e) => e.type === 'delivery_recovered').attempt, 3);
+});
+
+test('(h) untracked work still running for 3 hours: 5-minute rechecks, back-off 15/30/60, a status at +120, then the end', async () => {
+  const s = scenario({
+    model: (_p, ctx) => (ctx.isLastCheck ? 'The migration is still running; it will report when done.' : 'STILL_RUNNING'),
+  });
+  await s.build();
+  s.user();
+  s.agent('Running the migration; it will report when done.');
+  await s.to(400);
+  // first check + 6 rechecks every 5 minutes, then +15, +30, +60, and the final status at +120
+  assert.deepEqual(s.wakes.map((x) => x.min), [5, 10, 15, 20, 25, 30, 35, 50, 80, 140, 260]);
+  assert.deepEqual(s.got, [{ min: 260, text: 'The migration is still running; it will report when done.' }]);
+  assert.equal(s.no.pending().length, 0);
 });
