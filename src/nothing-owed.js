@@ -957,6 +957,13 @@ export function createNothingOwed(options = {}) {
     return 'report';
   }
 
+  // A stored report the host already covered (noteJobUserNotified): it ends unrun.
+  function skipNotified(rep) {
+    rep.userNotified = true;
+    emit({ type: 'report_skipped', conversationId: rep.conversationId, jobId: rep.job.id, reason: 'user_notified' });
+    return reportDone(rep);
+  }
+
   async function runReport(rep, { probe = false } = {}) {
     const cid = rep.conversationId;
     const job = rep.job;
@@ -978,8 +985,7 @@ export function createNothingOwed(options = {}) {
       if (rep.userNotified) {
         // the host told the user while this report waited (or before a restart)
         free();
-        emit({ type: 'report_skipped', conversationId: cid, jobId: job.id, reason: 'user_notified' });
-        return await reportDone(rep);
+        return await skipNotified(rep);
       }
       if (spendTurn(cid, 'report')) {
         free();
@@ -1202,8 +1208,7 @@ export function createNothingOwed(options = {}) {
         rep.userNotified = true;
         if (rep.state !== 'running') {
           rep.state = 'running';
-          emit({ type: 'report_skipped', conversationId: rep.conversationId, jobId: id, reason: 'user_notified' });
-          void track(reportDone(rep));
+          void track(skipNotified(rep));
         }
       }
       for (const o of outbox.filter((x) => x.jobId === id && (x.kind === 'report' || x.kind === 'fallback'))) {
