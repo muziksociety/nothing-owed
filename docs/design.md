@@ -2,82 +2,107 @@
 
 ## Goal
 
-An agent that says "I'll send it when it's done" should either send it or say why not. The agent cannot do this on its own: it runs only when a message arrives, and between turns nothing happens.
+An agent that says "I'll send it when it's done" should either send it or the user should be told plainly that it did not. The agent cannot do this on its own: it runs only when a message arrives, and between turns nothing happens. So code holds every alarm, and the model is only woken to judge and to write.
 
 ## Non-goals
 
 - Detecting promises. We do not classify replies.
 - Running the follow-up work. The check turn judges and delivers; long work stays wherever the agent runs it. The host only tells us when it starts and ends.
-- Guaranteeing exactly-once delivery of arbitrary content. That is the transport's job. We retry what we produced, at least once, until the transport confirms it or we give up.
+- Guaranteeing exactly-once delivery of arbitrary content. That is the transport's job. We retry what we produced, at least once, until the transport confirms it or we give up, and after a give-up we say so.
 
 ## The loop
 
 ```
 noteUserMessage(c)        -> counter[c] += 1
-noteReply(c, text)        -> counter[c] += 1; reply.seq = counter[c]
+noteReply(c, text)        -> counter[c] += 1; reply.seq = counter[c]; text keeps head + tail
   -> pending check for c exists?  yes: append reply (keep reply 1 + newest), due unchanged
                                   no:  create check, due = now + delay
-timer fires (earliest due: pending check, parked timeout, or delivery retry)
+noteReply(c, text, {kind: check|report}) -> counter += 1; one verify check (depth 1)
+timer fires (earliest due: pending check, dated timer, parked timeout, owed report, retry)
+  -> at most one model turn per conversation per pass; reports first
+  -> wait for a turn slot (maxConcurrent)
   -> isUserBusy(c)?  yes: due = now + busyRetry (no recheck used)
-  -> prompt = replies with "N messages back" + delivered(c, firstReply.at - lookback)
-  -> text = runTurn(c, prompt)            (same session)
+  -> daily cap used up?  yes: due = start of the next UTC day
+  -> owed "Missed:" notices for c go out first
+  -> prompt = time now + replies with "N messages back" + newest 40 delivered(c, firstReply.at - lookback)
+              + queued (retries, missed notices: "do not write these again")
+  -> text = runTurn(c, prompt, { signal })     (same session; turnTimeout -> abort, failed)
   -> parse(text)
        nothing          -> done
-       deliver          -> deliver(c, text), done
-       deliver_running  -> deliver(c, text minus marker), then as running
-       running          -> open tracked job for c?  yes: park on those jobs
+       deliver          -> deliver(c, text) unless an exact copy is delivered or queued; verify
+       deliver_running  -> deliver(c, text minus marker), verify, then as running
+       due <time>       -> deliver any text, verify; dated timer at <time> (past or > maxDue: running)
+       running, failed  -> open tracked job for c?  yes: park on those jobs
                                                     no:  rechecks < maxRechecks + backoff steps ?
-                                                           requeue (delay, then 15/30/60/120 min) : done
-       failed           -> done (event only)
+                                                           requeue (delay, then 15/30/60/120 min)
+                                                         : last check -> status, or code line
+verify: the delivered text joins the next check for c, delayMs later; depth + 1; stops past
+        maxVerifyDepth; never after a last check
 finishJob(j)
-  -> onJobFinished(c, job)  or  report turn -> deliver
+  -> onJobFinished(c, job)  or  an owed report (stored): waits for a busy user, retries like a
+     check, delivers the reply (verify) or, failed or declined, "<title> <status>: <first line>"
   -> checks parked on j with no other open job -> pending, due now -> run once
+start() finds jobs in the store -> onStartJobs keeps some; the rest finishJob(status 'lost')
 parked longer than jobTimeout
-  -> run once with the last-check prompt (one-line status), park one more period, then end
+  -> run once with the last-check prompt (status: no longer watched), park one more period, end
 deliver() throws
   -> keep { text, attempts } in the outbox; resend in retryMs (or err.retryAfterMs)
-  -> permanent error or attempts = max -> delivery_failed; next delivery to c is preceded by "Missed: ..."
+  -> permanent error or attempts = max -> delivery_failed; missed[c] += full text;
+     fresh check delayMs later (not after a permanent error); flushMissed(c) for the host
 ```
 
 ## Decisions
 
-**Fixed window, no extension.** The first reply with no pending check sets the due time; later replies join the list and never move it. v0.1 moved the due time with every reply ("one check per quiet period"). That was cheaper, but it let a long conversation push an owed delivery back forever: a user chatting non-stop for an hour never got the thing promised in minute two. The fixed window costs about one check per 5 minutes of active conversation. We accept that for accountability.
+**Fixed window, no extension.** The first reply with no pending check sets the due time; later replies join the list and never move it. v0.1 moved the due time with every reply ("one check per quiet period"). That was cheaper, but it let a long conversation push an owed delivery back forever. The fixed window costs about one check per 5 minutes of active conversation. We accept that for accountability.
 
-**Keep the first reply.** When a check's list overflows `maxReplies`, it keeps reply 1 plus the newest ones. In a long window, the first reply is often the one that made the promise; dropping it would hide the debt the check exists for.
+**Keep the first reply, and the end of each reply.** When a check's list overflows `maxReplies`, it keeps reply 1 plus the newest ones. A reply longer than `maxTextLength` keeps its first and last halves: "Here is the analysis... I will send the PDF tonight" puts the promise at the end, and v0.2 clipped it off.
 
-**Messages back, not just timestamps.** A model can rarely map a clock time to a point in its own history, but "8 messages back" it can find. Each reply carries `seq`, the conversation's message count right after it; the prompt shows `counter - seq + 1`, so the newest message is "1 message back". User messages (`noteUserMessage`) and every message the user saw count: normal replies, check replies and job reports. `system` replies do not. The counter persists with the store. The package counts its own deliveries; a `noteReply` call routed back through the host during one of them is ignored, so it is never counted twice.
+**Messages back, not just timestamps.** A model can rarely map a clock time to a point in its own history, but "8 messages back" it can find. Each reply carries `seq`, the conversation's message count right after it; the prompt shows `counter - seq + 1`. User messages and every message the user saw count; `system` replies do not.
 
-**`STILL_RUNNING` is a third answer, and a trailing line.** Without it, an agent waiting on background work has two bad choices: say nothing (and lose the debt) or send "still working" every few minutes. With two promises, one ready and one running, the agent delivers the ready one and ends with a `STILL_RUNNING` line; the scheduler delivers the text and requeues the same record. On the last check the marker is stripped and nothing is requeued.
+**A failed check is an unanswered check, not a finished one.** v0.2 dropped the debt when the check turn threw or came back empty: one model outage at the wrong minute and the promise was gone. Now `failed` walks the same ladder as `STILL_RUNNING`. If the ladder runs out with no answer, the user gets a fixed code-written line ("I could not check on what I promised you earlier. Ask me again if it is still open."). The model is not asked to write it, because the model is the part that is failing.
 
-**Jobs are tracked in code, not in the model.** Timed rechecks are fine for short work but waste a model wake every 5 minutes on an hour-long job, and they rely on the model remembering the job exists. The host already knows when it starts long work and for which conversation, so it says so (`trackJob`, `finishJob`, `wrapJob`). A `running` answer with an open job parks the check: no wakes until the job ends. The job's end triggers one report turn (or the host's `onJobFinished`), then the parked check runs once to catch anything else. Report replies are kind `report` and never schedule a check.
+**Turns can hang; code times them out.** A `runTurn` that never settles used to block its conversation forever. `turnTimeoutMs` (3 minutes) makes it a failed check and aborts `ctx.signal`, so the host can kill the call.
 
-**Back-off for untracked work.** Work the host never tracked can still run for hours. After `maxRechecks` rechecks at `delayMs`, the check backs off: 15, 30, 60, then 120 minutes (`backoffMs`), and the last step asks for a one-line status and ends. Six wakes in the first half hour catch short work; the ladder keeps a 3-hour job from costing 36 wakes. The step count lives in the record, so a restart continues the ladder.
+**The package reads its own replies back.** A check reply is a message the user saw, and it can hold a new promise ("the rest in ten minutes"). v0.2 never looked at it again. Now every package delivery schedules one verify check `delayMs` later, carrying a depth; the chain stops at `maxVerifyDepth` (3). It never follows a last-check status, which by design says the work is no longer watched. A word-for-word repeat of something delivered or queued is not sent and starts nothing, so a model that keeps restating the same promise cannot loop.
 
-**Safety net for jobs that never end.** A host can forget `finishJob`, or a job can hang. After `jobTimeoutMs` (2 hours) the parked check runs once with the last-check prompt, so the user hears a one-line status, then parks one more period and ends. No endless parking, no endless nagging.
+**Dated promises get a timer in code.** "I'll remind you tomorrow at 9" used to sit through the 4-hour ladder and end with a status line. The agent can now answer `DUE <ISO time>`; the timer is stored, and at that time a check runs with the replies that made the promise. The prompt shows the time now so the agent can write one. Past times and times beyond `maxDueMs` (30 days) count as `STILL_RUNNING`, so a bad date cannot park a debt for a year.
 
-**Delivery retry resends, never regenerates.** `deliver()` is done only when it resolves; the host must throw when the platform did not confirm the send. A failed check reply or report goes to an outbox in the store with its attempt count, and is resent every `retryMs` up to `maxDeliveryAttempts`. Regenerating would cost a model turn per attempt and might produce a different answer; the text is already written. `isPermanentError` stops at once (a blocked user, a deleted chat), `err.retryAfterMs` honors a platform's rate limit. After a give-up, the user gets one short `Missed:` line before the next delivery in that conversation, so a lost message is at least visible.
+**`STILL_RUNNING` is a third answer.** Without it, an agent waiting on background work has two bad choices: say nothing (and lose the debt) or send "still working" every few minutes. With two promises, one ready and one running, the agent delivers the ready one with a `STILL_RUNNING` first or last line; the scheduler delivers the text and requeues the same record.
 
-**The delivered list comes from the host.** The model's context contains what it wrote, including text that never left the process (a background turn, a failed send, a crash between generation and delivery). The only reliable record of what the user saw is the transport's success log. The earlier prompt version without it caught 3 of 4 owed cases in the replay; with it, 4 of 4.
+**The parser is strict about what it sends.** v0.2 delivered anything that was not exactly the marker, so `NOTHING_OWED - all delivered` went to the user. Markers now count as the first or last line, in any case, decorated, with a short note. A reply under 200 characters that mentions `NOTHING_OWED` is never sent. A `DUE` line whose time does not parse is `running`, never content. Reports use the same parser.
 
-**The window starts before the first reply.** A streamed reply reaches the user before its turn ends and before `noteReply` is called, so the delivered window opens `deliveredLookbackMs` earlier.
+**Jobs are tracked in code, not in the model.** The host knows when it starts long work and for which conversation, so it says so (`trackJob`, `finishJob`, `wrapJob`). A `running` or `failed` answer with an open job parks the check: no wakes until the job ends.
+
+**A report is owed until it is delivered or replaced.** v0.2 ran the report turn at once, ignoring a busy user, and dropped it on failure. Now the finished job becomes a stored report record: it waits for `isUserBusy`, retries on the check ladder, and if the turn keeps failing or the model declines (`NOTHING_OWED`, a bare `STILL_RUNNING`), code sends `<title> <status>: <first line of output>`. The job's own output is the most honest fallback there is.
+
+**Jobs do not survive a restart unless the host says so.** A job in the store at `start()` was started by the old process; in most hosts it died with it. v0.2 kept it open forever, and every later `STILL_RUNNING` in that conversation parked on the zombie. Now such jobs finish as `lost`, through the normal report path, unless `onStartJobs(jobs)` returns their ids.
+
+**Back-off for untracked work.** After `maxRechecks` rechecks at `delayMs`, the check backs off: 15, 30, 60, then 120 minutes, and the last step asks for a one-line status that says plainly the work is no longer watched ("it will report" was a promise nothing kept). If that last check still has nothing but `STILL_RUNNING`, code sends its own line.
+
+**Safety net for jobs that never end.** After `jobTimeoutMs` (2 hours) the parked check runs once with the last-check prompt, then parks one more period and ends.
+
+**Delivery retry resends, never regenerates.** `deliver()` is done only when it resolves. A failed delivery goes to an outbox with its attempt count and is resent every `retryMs` up to `maxDeliveryAttempts`. Checks that run meanwhile see it in a "queued, do not write these again" list, and an exact copy is skipped. After a give-up the full text is kept as a `Missed:` notice (v0.2 kept 120 characters and waited for the next package delivery, which might never come). A fresh check `delayMs` later sends it first; the host can also take it with `flushMissed()` before its next message. No fresh check after a permanent error.
+
+**The package logs its own deliveries.** v0.2's quick start never put the package's own deliveries in the delivered log, so the next check thought they were missing. The package now notes every confirmed delivery itself; the built-in log treats the same text noted twice within a minute as one entry, so hosts that also log it are fine.
+
+**No delivering guard.** v0.2 ignored every `noteReply` in a conversation while the package was delivering there, which dropped a normal reply sent at that moment. Now the package recognizes only its own text coming back (the same text within a minute), and passes `{ kind }` to `deliver()` so hosts can mark it.
+
+**Bounds.** At most `maxConcurrent` (2) model turns run at once across conversations, so a burst of due checks does not hit rate limits. `dailyCap` (60) bounds the turns per conversation per day. The delivered list in the prompt shows the newest 40 (v0.2 put 400 entries, 135,000 characters, into one prompt). The built-in log drops conversations idle longer than its `maxAgeMs`. One tick pass never runs two records of the same conversation, because they share one session.
+
+**The delivered list comes from the host.** The model's context contains what it wrote, including text that never left the process. The only reliable record of what the user saw is the transport's success log. The earlier prompt version without it caught 3 of 4 owed cases in the replay; with it, 4 of 4.
 
 **Same session, not a fresh one.** The agent needs its own context to know what it meant. A fresh model with a transcript excerpt would be an extractor with extra steps.
 
-**Check replies never re-arm.** Otherwise a check that delivers would schedule a check that delivers. The scheduler ignores `noteReply` calls made while it is delivering its own reply in the same conversation, so hosts that route every outgoing message through one function are safe. Replies of kind `check`, `report` or `system` never schedule either.
-
-**User turns win.** A check that fires while the user is mid-conversation would interleave with a live turn in the same session. `isUserBusy` makes it wait. Waiting does not use up rechecks. The report turn does not consult `isUserBusy`: the host calls `finishJob` and so picks the moment.
-
-**Failures are silent.** A check that errors, or returns an empty or canned failure text, sends nothing to the user. It surfaces through `onEvent` so the host can log it. A missed check is a missed safety net, not a new problem for the user.
-
-**Persistence.** The whole state is saved on every change as `{ version: 2, records, counters, jobs, outbox, missed }`. A v0.1 store held a plain array of checks; `start()` still loads it. On `start()`, checks that were `running` return to `pending` and run again; parked checks stay parked while their jobs are open, and run at once if their jobs are gone. The built-in delivered log can persist too (`createDeliveredLog({ path })`), because a reloaded check needs the delivered list from before the restart.
+**Persistence.** The whole state is saved on every change as `{ version: 3, records, reports, counters, jobs, outbox, missed, turnsByDay }`. v0.1 (a plain array) and v0.2 stores load. On `start()`, checks and reports that were running return to pending; parked checks stay parked while their jobs are open; dated timers keep their time.
 
 ## Cost accounting
 
-`runTurn` may return `{ text, usage, costUsd }`. The scheduler passes these to `onUsage` and emits a `usage` event, for check turns and report turns alike (`checkId` is null on a report turn, `jobId` is set). Compute cost from the turn's own token counts: on a resumed session, some runtimes report a total cost that includes earlier turns of the session.
+`runTurn` may return `{ text, usage, costUsd }`. The scheduler passes these to `onUsage` and emits a `usage` event, for check turns and report turns alike. Compute cost from the turn's own token counts: on a resumed session, some runtimes report a total cost that includes earlier turns of the session.
 
-The fixed window makes checks more frequent in long conversations than v0.1's quiet-period timer. Parking makes long jobs cheaper than timed rechecks. Retries cost no model turns.
+Verify checks add one turn per package delivery. Failed checks now come back, which costs turns during an outage; `maxConcurrent` and `dailyCap` bound that. Parking makes long jobs cheap. Retries cost no model turns.
 
 ## Open questions
 
-- Warm-cache cost per check in live use (being measured).
-- Whether a per-conversation daily cap on checks is worth adding as an option.
+- The v0.3 prompt (verify, `DUE`, queued list, the last-check wording) has not been replayed on a real model. Whether a given model writes valid `DUE` lines is unmeasured.
+- Warm-cache cost per check in live use, and the daily cost with verify checks.
+- Whether check turns should run in a fork of the session instead of the session itself, so they do not grow the conversation.

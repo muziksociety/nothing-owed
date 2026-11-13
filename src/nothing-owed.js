@@ -694,6 +694,7 @@ export function createNothingOwed(options = {}) {
       let rec = find(cid, 'pending');
       if (rec) {
         rec.replies = keepFirst([...rec.replies, reply]);
+        if (rec.kind === 'verify') rec.kind = 'window'; // a new reply joined: it is a window check now
         emit({ type: 'merged', conversationId: cid, checkId: rec.id, replies: rec.replies.length, due: rec.due });
       } else {
         rec = { id: newId('chk', t), conversationId: cid, state: 'pending', kind: 'window', due: t + delayMs, replies: [reply], rechecks: 0, depth: 0 };

@@ -9,11 +9,12 @@ import { createNothingOwed, createFileStore } from 'nothing-owed';
 const sessions = new Map(); // conversationId -> CLI session id (persist this in a real host)
 
 // Run one print-mode turn. The prompt goes in on stdin, so long check prompts are fine.
-function claude(prompt, sessionId) {
+function claude(prompt, sessionId, signal) {
   const args = ['-p', '--output-format', 'json'];
   if (sessionId) args.push('--resume', sessionId);
   return new Promise((resolve, reject) => {
-    const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], shell: process.platform === 'win32' });
+    // signal: aborted by nothing-owed after turnTimeoutMs, which kills the child process
+    const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'], shell: process.platform === 'win32', signal });
     let out = '';
     let err = '';
     child.stdout.on('data', (d) => (out += d));
@@ -42,8 +43,8 @@ const costFromUsage = (u = {}) =>
     (u.cache_read_input_tokens || 0) * PRICE.cacheRead +
     (u.output_tokens || 0) * PRICE.output) / 1e6;
 
-async function turn(conversationId, prompt) {
-  const res = await claude(prompt, sessions.get(conversationId));
+async function turn(conversationId, prompt, ctx) {
+  const res = await claude(prompt, sessions.get(conversationId), ctx?.signal);
   sessions.set(conversationId, res.session_id);
   return { text: res.result ?? '', usage: res.usage, costUsd: costFromUsage(res.usage) };
 }
@@ -51,9 +52,9 @@ async function turn(conversationId, prompt) {
 const owed = createNothingOwed({
   store: createFileStore('./data/pending-checks.json'),
   runTurn: turn,
+  // The package counts and logs what it delivers; just send it.
   deliver: async (cid, text) => {
     console.log(`[to user in ${cid}] ${text}`);
-    owed.noteDelivered(cid, text);
   },
   onUsage: ({ conversationId, costUsd }) => console.log(`[check cost] ${conversationId} $${costUsd?.toFixed(4)}`),
 });

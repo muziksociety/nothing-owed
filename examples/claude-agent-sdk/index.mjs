@@ -23,10 +23,15 @@ async function turn(conversationId, prompt, extraOptions = {}) {
 const owed = createNothingOwed({
   store: createFileStore('./data/pending-checks.json'),
   // Keep the check turn short: it should judge and deliver, not start new long work.
-  runTurn: (cid, prompt) => turn(cid, prompt, { maxTurns: 8 }),
+  // ctx.signal is aborted after turnTimeoutMs; the SDK stops on its abortController.
+  runTurn: (cid, prompt, ctx) => {
+    const abortController = new AbortController();
+    ctx.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+    return turn(cid, prompt, { maxTurns: 8, abortController });
+  },
+  // The package counts and logs what it delivers; just send it.
   deliver: async (cid, text) => {
     console.log(`[to user in ${cid}] ${text}`);
-    owed.noteDelivered(cid, text);
   },
   onUsage: ({ conversationId, usage }) => console.log('[check usage]', conversationId, usage),
 });

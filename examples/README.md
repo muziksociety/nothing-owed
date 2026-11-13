@@ -11,5 +11,8 @@ The examples import `nothing-owed` by name. Inside this repository that resolves
 package itself (Node package self-reference), so they run from a clone without installing.
 
 The rule all adapters share: call `noteDelivered` only after the transport confirmed the
-send, and call `noteReply` for the agent's normal replies (not for check replies or job reports), `noteUserMessage`
-for each user message, and throw from `deliver` when the platform did not confirm the send.
+send, `noteReply` for the agent's normal replies, `noteUserMessage` for each user message, and
+throw from `deliver` when the platform did not confirm the send. The package counts and logs its
+own deliveries, so logging them again in your send path is harmless. Send what `flushMissed(id)`
+returns before your next normal message, and pass `ctx.signal` to your model call so a check that
+runs past `turnTimeoutMs` is really stopped.

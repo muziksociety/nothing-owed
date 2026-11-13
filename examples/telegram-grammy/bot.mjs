@@ -20,7 +20,7 @@ async function askAgent(conversationId, text) {
 const owed = createNothingOwed({
   store: createFileStore('./data/pending-checks.json'),
   deliveredLog: createDeliveredLog({ path: './data/delivered.json' }),
-  runTurn: (cid, prompt) => askAgent(cid, prompt),
+  runTurn: (cid, prompt) => askAgent(cid, prompt), // pass ctx.signal on to your agent if it can stop
   deliver: async (cid, text) => {
     const [chatId, threadId] = cid.split(':');
     await bot.api.sendMessage(chatId, text, threadId ? { message_thread_id: Number(threadId) } : {});
@@ -37,6 +37,7 @@ bot.on('message:text', async (ctx) => {
   busy.add(cid);
   try {
     const reply = await askAgent(cid, ctx.msg.text);
+    for (const line of owed.flushMissed(cid)) await ctx.reply(line); // owed "Missed:" notices first
     await ctx.reply(reply);
     owed.noteReply(cid, reply); // the timer starts here
   } finally {
