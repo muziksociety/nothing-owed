@@ -323,7 +323,7 @@ Also exported: `buildPrompt()`, `buildReportPrompt()`, `parseOutcome()`, `parseC
 
 ## Results
 
-**Small replay: 9 past conversations, one model, v0.1 prompt.** A later replay of the v0.3 prompt on 18 cases, 3 runs each, scored 49/54 runs correct with Claude and 41/54 with DeepSeek; the misses it found (marker combinations, tool-call markup sent as text, time zones, claims about files) are handled in v0.4's parser and prompt. **The v0.4 prompt has not been replayed on a real model yet.** Everything v0.4 adds on the code side is covered by tests on a fake clock with a fake model; whether a given model follows the new prompt lines is not measured.
+**Small replay: 9 past conversations, one model, v0.1 prompt.** A later replay of the v0.3 prompt on 18 cases, 3 runs each, scored 49/54 runs correct with Claude and 41/54 with DeepSeek; the misses it found (marker combinations, tool-call markup sent as text, time zones, claims about files) are handled in v0.4's parser and prompt. The v0.4.1 prompt was then replayed with Claude on the 14 real cases, 2 runs each: 23/28 correct, **0 false alarms**, 2 misses (a running build answered as `NOTHING_OWED` once each), every combined `STILL_RUNNING` + `DUE` answer now parsed correctly, and one local-time reminder set 1.5 hours early twice. Cost: about $0.54 per check on a cold prompt cache, $0.01 to $0.03 warm. DeepSeek and the 4 synthetic cases were not rerun on v0.4.1. Small samples: treat these as a smoke test, not a benchmark. Everything else v0.4 adds is covered by tests on a fake clock with a fake model.
 
 | Test (v0.1 prompt, offline replay, tools sealed off) | Result |
 |---|---|

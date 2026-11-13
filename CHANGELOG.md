@@ -30,7 +30,7 @@ From a review of normal day-to-day flows.
 ## [0.4.0] - 2026-11-13
 
 Fixes from a second independent review and from a replay of the v0.3 prompt on two real models.
-The v0.4 prompt itself has not been replayed on a real model yet.
+The v0.4.1 prompt was replayed with Claude on 14 real cases (23/28 correct, 0 false alarms); see README Results.
 
 ### Changed
 
