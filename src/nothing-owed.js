@@ -1017,6 +1017,8 @@ export function createNothingOwed(options = {}) {
       if (outcome === 'failed') turnFailed();
       else turnOk(cid);
 
+      // the host told the user while the turn ran: a failed turn has nothing left to retry for
+      if (outcome === 'failed' && rep.userNotified) return await skipNotified(rep);
       if (outcome === 'failed') {
         rep.attempts = (rep.attempts || 0) + 1;
         if (rep.attempts <= totalRechecks || (circuitOn() && circuit.pauseMs > 0)) {

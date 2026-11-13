@@ -276,3 +276,25 @@ test('a report dropped for userNotified never becomes a DUE dated check', async 
   await w.advance(25 * 60 * MIN);
   assert.deepEqual(texts(w), []);
 });
+
+test('a report turn that fails after noteJobUserNotified ends at once: no report_retry, checks unpark', async () => {
+  let fail;
+  const w = await five({ reply: (_c, _p, ctx) => (ctx.kind === 'report' ? new Promise((_, rej) => { fail = rej; }) : 'STILL_RUNNING') });
+  w.no.noteReply(C, 'Rendering, I will report.');
+  w.no.trackJob(C, 'j', { title: 'render' });
+  await w.advance(FIVE);
+  await w.advance(FIVE);
+  assert.equal(w.no.parked().length, 1);
+  w.reply = (_c, _p, ctx) => (ctx.kind === 'report' ? new Promise((_, rej) => { fail = rej; }) : 'NOTHING_OWED');
+  await w.no.finishJob('j', { status: 'error', text: 'x' });
+  await new Promise((r) => setImmediate(r));
+  w.no.noteJobUserNotified('j');
+  fail(new Error('model down'));
+  await w.no.idle();
+  assert.ok(!w.types().includes('report_retry'), 'no retry for a report the host covered');
+  assert.deepEqual(ev(w, 'report_skipped').map((e) => e.reason), ['user_notified']);
+  assert.ok(w.types().includes('report_done'));
+  assert.deepEqual(w.no.reports(), []);
+  assert.equal(w.no.parked().length, 0, 'the parked check unparked at once');
+  assert.deepEqual(texts(w), []);
+});
