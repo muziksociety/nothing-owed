@@ -298,3 +298,13 @@ test('a report turn that fails after noteJobUserNotified ends at once: no report
   assert.equal(w.no.parked().length, 0, 'the parked check unparked at once');
   assert.deepEqual(texts(w), []);
 });
+
+test('finishJob userNotified emits report_done like every other report path', async () => {
+  const w = await five({ reply: 'report' });
+  w.no.trackJob(C, 'j');
+  await w.no.finishJob('j', { status: 'error', userNotified: true });
+  await w.no.idle();
+  const order = w.types().filter((t) => ['job_finished', 'report_skipped', 'report_done'].includes(t));
+  assert.deepEqual(order, ['job_finished', 'report_skipped', 'report_done']);
+  assert.deepEqual(ev(w, 'report_done').map((e) => [e.conversationId, e.jobId]), [[C, 'j']]);
+});

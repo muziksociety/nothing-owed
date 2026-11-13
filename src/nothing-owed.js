@@ -1172,6 +1172,7 @@ export function createNothingOwed(options = {}) {
         // the host already told the user how it ended: no report turn, no onJobFinished
         emit({ type: 'report_skipped', conversationId: cid, jobId: id, reason: 'user_notified' });
         unparkFor(job);
+        emit({ type: 'report_done', conversationId: cid, jobId: id });
         void save();
         arm();
         void track(api.tick());
