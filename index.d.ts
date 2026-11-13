@@ -20,8 +20,10 @@ export interface CheckReply {
   outcome: Outcome;
   /** The text to deliver now ('' unless the outcome is deliver, deliver_running, or due with content). */
   text: string;
-  /** Outcome 'due': the epoch ms the agent set with a `DUE <ISO time>` line. */
+  /** Outcome 'due': the epoch ms the agent set with a `DUE <ISO time with zone>` line. */
   dueAt?: number;
+  /** Outcome 'due' with a STILL_RUNNING marker too: the timer is set AND the check keeps watching. */
+  running?: boolean;
 }
 
 /** Why a check turn runs. */
@@ -44,6 +46,14 @@ export interface CheckRecord {
   depth?: number;
   /** Dated checks: the time the agent set. */
   dueAt?: number;
+  /** DUE-chain depth (capped by maxDueDepth). */
+  dueDepth?: number;
+  /** When this record (or the run that delivered its text) last ran: the duplicate guard starts there. */
+  lastRunAt?: number;
+  /** STILL_RUNNING with an open job already got its one recheck: the next one parks. */
+  jobRecheck?: boolean;
+  /** Waiting for the next day because a daily cap was reached. */
+  capped?: boolean;
   /** Parked checks: the open job ids it waits for. */
   parkedOn?: string[];
   /** Parked checks: when it parked. */
@@ -76,6 +86,8 @@ export interface ReportRecord {
   /** Failed report turns so far. */
   attempts: number;
   state: 'pending' | 'running';
+  /** Set (and saved) right before the report is sent: after a restart it is never sent again. */
+  delivering?: boolean;
 }
 
 /** What a package delivery is. Passed to deliver() so the host can forward it to noteReply. */
@@ -104,23 +116,48 @@ export interface OutboxItem {
   at?: number;
 }
 
-/** What a store holds. v0.1 stores held a plain CheckRecord[]; that and v0.2 objects still load. */
+export interface MissedNotice {
+  /** The full text that never landed (sent as "Missed: <text>"). */
+  text: string;
+  at: number;
+  /** Next attempt (15 min after the give-up, doubling to 6 h). */
+  due: number;
+  wait: number;
+}
+
+/** What a store holds. v0.1 stores held a plain CheckRecord[]; that and v0.2/v0.3 objects still load. */
 export interface StoredState {
-  version: 3;
+  version: 4;
   records: CheckRecord[];
   reports: ReportRecord[];
   counters: Record<string, number>;
   jobs: Record<string, TrackedJob>;
   outbox: OutboxItem[];
-  /** Per conversation: full texts of deliveries that were given up on (sent as "Missed: ..."). */
-  missed: Record<string, string[]>;
+  /** Per conversation: deliveries that were given up on, each on its own timer. */
+  missed: Record<string, MissedNotice[]>;
   /** Per conversation: model turns on the current UTC day. */
   turnsByDay: Record<string, { day: number; n: number }>;
+  globalTurns: { day: number; n: number; told: boolean };
+  /** Per conversation: the days a limit line went out, and whether a give-up line went this outage. */
+  notices: Record<string, Record<string, unknown>>;
+  circuit: { fails: number; openUntil: number; pauseMs: number };
+  /** Per conversation: last activity (idle conversations are pruned after idlePruneMs). */
+  lastActive: Record<string, number>;
 }
 
+/**
+ * Where the state lives. One process per store: the built-in file store takes a lock file.
+ */
 export interface Store {
   load(): StoredState | CheckRecord[] | Promise<StoredState | CheckRecord[]>;
   save(state: StoredState): void | Promise<void>;
+  /** Used for the final save in stop(), so a restart in the same tick reads the latest state. */
+  saveSync?(state: StoredState): void;
+  /** Called by start(); throw to refuse a second process. */
+  lock?(): void;
+  unlock?(): void;
+  /** Where the built-in delivered log lives when you pass no deliveredLog: a shared Map or a file. */
+  deliveredBacking?: { map?: Map<string, unknown[]>; path?: string; debounceMs?: number };
 }
 
 export interface TurnResult {
@@ -163,9 +200,16 @@ export interface DeliverResult {
 
 export interface GiveUpContext {
   conversationId: string;
-  /** failed: the checks kept failing; still_running: the last check had nothing but STILL_RUNNING. */
-  reason: 'failed' | 'still_running';
-  checkId?: string;
+  /**
+   * failed: the checks kept failing (at most once per conversation per outage, never while the
+   * circuit is open); still_running: the last check had nothing but STILL_RUNNING; verify_capped:
+   * the verify chain hit maxVerifyDepth; daily_cap: a daily cap was reached (`until` is set);
+   * due_limit: a DUE chain or the dated-timer count hit its limit. The last three go at most once
+   * per conversation per day.
+   */
+  reason: 'failed' | 'still_running' | 'verify_capped' | 'daily_cap' | 'due_limit';
+  checkId?: string | null;
+  until?: number;
 }
 
 type Ids = Array<string | number>;
@@ -178,14 +222,21 @@ export type NothingOwedEvent =
   | { type: 'dated'; at: number; conversationId: string; checkId: string; due: number }
   | { type: 'check_started'; at: number; conversationId: string; checkId: string; replies: number; delivered: number; recheck: number; isLastCheck: boolean; reason: CheckReason }
   | { type: 'yielded'; at: number; conversationId: string; checkId: string | null; jobId?: string }
-  | { type: 'daily_cap'; at: number; conversationId: string; checkId: string | null; jobId?: string; until: number }
+  | { type: 'busy_stuck'; at: number; conversationId: string; checkId: string | null; since: number }
+  | { type: 'daily_cap'; at: number; conversationId: string; checkId: string | null; jobId?: string; scope?: 'conv' | 'global'; until: number }
+  | { type: 'global_daily_cap'; at: number; cap: number; until: number }
+  | { type: 'circuit_open'; at: number; fails: number; until: number; pauseMs: number }
+  | { type: 'circuit_closed'; at: number; after: number }
+  | { type: 'due_limit'; at: number; conversationId: string; checkId: string | null; dueDepth: number; dated: number }
+  | { type: 'missed_retry'; at: number; conversationId: string; retryInMs: number; error: unknown }
+  | { type: 'report_done'; at: number; conversationId: string; jobId: string }
   | { type: 'turn_timeout'; at: number; conversationId: string; kind: 'check' | 'report'; checkId?: string | null; jobId?: string | null }
   | { type: 'nothing_owed'; at: number; conversationId: string; checkId: string; ms: number }
   | { type: 'still_running'; at: number; conversationId: string; checkId: string; recheck: number; ms: number }
   | { type: 'delivered'; at: number; conversationId: string; checkId: string; chars: number; ms: number; ids?: Ids; stillRunning: boolean }
   | { type: 'duplicate_skipped'; at: number; conversationId: string; checkId: string | null; jobId?: string; chars: number }
   | { type: 'failed'; at: number; conversationId: string; checkId: string; recheck: number; ms: number }
-  | { type: 'gave_up'; at: number; conversationId: string; checkId?: string; reason: 'failed' | 'still_running'; delivered: boolean }
+  | { type: 'gave_up'; at: number; conversationId: string; checkId?: string | null; reason: GiveUpContext['reason']; delivered: boolean; suppressed?: boolean }
   | { type: 'parked'; at: number; conversationId: string; checkId: string; jobIds: string[]; until: number }
   | { type: 'unparked'; at: number; conversationId: string; checkId: string; jobId: string | null }
   | { type: 'park_timeout'; at: number; conversationId: string; checkId: string; jobIds: string[] }
@@ -201,7 +252,7 @@ export type NothingOwedEvent =
   | { type: 'delivery_failed'; at: number; conversationId: string; kind: DeliveryKind; checkId?: string; jobId?: string; attempts: number; permanent: boolean; error: unknown }
   | { type: 'missed_notice'; at: number; conversationId: string }
   | ({ type: 'usage'; at: number } & UsageInfo)
-  | { type: 'error'; at: number; stage: 'store' | 'check' | 'isUserBusy' | 'report' | 'onJobFinished' | 'onStartJobs' | 'deliver' | 'deliveredLog'; conversationId?: string; checkId?: string; jobId?: string; error: unknown }
+  | { type: 'error'; at: number; stage: 'store' | 'check' | 'isUserBusy' | 'getDelivered' | 'report' | 'onJobFinished' | 'onStartJobs' | 'onTurnStart' | 'onTurnEnd' | 'deliver' | 'deliveredLog'; conversationId?: string; checkId?: string; jobId?: string; error: unknown }
   | { type: 'started'; at: number; pending: number; parked: number; dated: number; jobs: number; lost: number; reports: number; outbox: number }
   | { type: 'stopped'; at: number };
 
@@ -209,12 +260,20 @@ export interface DeliveredLog {
   /** The same text noted twice within a minute (for example by the host and by the package) stays one entry. */
   note(conversationId: string, text: string, opts?: { at?: number; id?: string | number }): TimedText;
   since(conversationId: string, sinceMs?: number): TimedText[];
+  /** The oldest time the log still covers; a check whose window starts earlier says its list may be incomplete. */
+  horizon?(): number;
   clear(conversationId?: string): void;
+  /** Write a debounced change now. */
+  flush?(): void;
 }
 
 export interface DeliveredLogOptions {
   /** Persist to this JSON file. Default: memory only. */
   path?: string;
+  /** A store's deliveredBacking. */
+  backing?: { map?: Map<string, unknown[]>; path?: string; debounceMs?: number };
+  /** Batch file writes this long. Default 100 (pending writes are flushed when the process exits). */
+  debounceMs?: number;
   /** Default 400. */
   maxPerConversation?: number;
   /** Entries, and whole conversations idle this long, are dropped. Default 2 days. */
@@ -227,8 +286,12 @@ export interface DeliveredLogOptions {
 export interface BuildPromptInput {
   replies: ReplyEntry[];
   delivered?: TimedText[];
-  /** Deliveries waiting for a retry and missed notices: sent automatically, not to be rewritten. */
+  /** Deliveries waiting for a retry: sent automatically, not to be rewritten. */
   queued?: TimedText[];
+  /** Deliveries given up on: "write it again if still needed". */
+  failed?: TimedText[];
+  /** Set when the send log does not reach back to the window start: the oldest time it covers. */
+  deliveredSince?: number;
   isLastCheck?: boolean;
   userLabel?: string;
   /** Texts longer than this keep their head and tail. Default 300. */
@@ -239,6 +302,8 @@ export interface BuildPromptInput {
   messageCount?: number;
   /** The time now (shown so the agent can write DUE times). */
   now?: number;
+  /** IANA zone of the user: "Now: <local time> (<zone>), <UTC>". Without it: "Now (UTC): ...". */
+  timeZone?: string;
   reason?: CheckReason;
   /** Dated checks: the time the agent set. */
   dueAt?: number;
@@ -260,6 +325,8 @@ export interface NothingOwedOptions {
   backoffMs?: number[];
   /** When isUserBusy() says yes, try again after this long. Default 60000. */
   busyRetryMs?: number;
+  /** isUserBusy() true this long emits busy_stuck once; the check keeps waiting. Default 30 min. */
+  busyStuckMs?: number;
   /** The delivered window starts this long before the first reply of the check. Default 600000. */
   deliveredLookbackMs?: number;
   /** A check keeps at most this many replies: reply 1 plus the newest. Default 12. */
@@ -274,14 +341,42 @@ export interface NothingOwedOptions {
   jobTimeoutMs?: number;
   /** A runTurn that does not settle in this long counts as failed and its ctx.signal is aborted. Default 180000 (3 min). 0 disables. */
   turnTimeoutMs?: number;
+  /** deliver, isUserBusy, getDelivered, onJobFinished, onStartJobs and the turn hooks time out after this. A timed-out deliver goes to the outbox; a timed-out isUserBusy counts as busy. Default 30000. 0 disables. */
+  callbackTimeoutMs?: number;
   /** A delivery the package made gets one verify check; the chain stops after this many. Default 3. */
   maxVerifyDepth?: number;
   /** A DUE time further away than this is treated as STILL_RUNNING. Default 30 days. */
   maxDueMs?: number;
-  /** Model turns (checks and reports) running at once across conversations. Default 2. */
+  /** A chain of DUE answers stops after this many timers, with a code-written line. Default 10. */
+  maxDueDepth?: number;
+  /** Dated timers per conversation at once; past it, a code-written line. Default 5. */
+  maxDatedPerConversation?: number;
+  /** Model turns (checks and reports) running at once across conversations, before the backlog bonus. Default 2. */
   maxConcurrent?: number;
-  /** Model turns per conversation per UTC day; past it checks wait for the next day and reports use the fallback line. Default 60. 0 disables. */
+  /** The slot count grows by one per 25 waiting turns, up to this. Default 8. */
+  maxConcurrentLimit?: number;
+  /** Model turns per conversation per UTC day; past it checks wait for the next day (one code-written line a day) and reports use the fallback line. Default 60. 0 disables. */
   dailyCap?: number;
+  /** Of dailyCap, this many are kept for window and dated checks. Default 10. */
+  dailyCapReserve?: number;
+  /** Model turns per UTC day across all conversations; reaching it emits global_daily_cap once. Default 1000. 0 disables. */
+  globalDailyCap?: number;
+  /** Failed turns in a row (any conversation) that open the circuit breaker. Default 5. 0 disables. */
+  circuitFailures?: number;
+  /** First pause of an open circuit; it doubles after each failed probe. Default 15 min. */
+  circuitPauseMs?: number;
+  /** Longest pause. Default 2 h. */
+  circuitMaxPauseMs?: number;
+  /** First retry of a missed notice after a give-up; it doubles while sends fail. Default 15 min. */
+  missedRetryMs?: number;
+  /** Longest wait between missed-notice attempts. Default 6 h. */
+  missedMaxRetryMs?: number;
+  /** Counters of conversations idle this long (and with nothing open) are dropped. Default 30 days. */
+  idlePruneMs?: number;
+  /** State writes are batched this long; stop() writes at once. Default 100. 0 writes on every change. */
+  saveDebounceMs?: number;
+  /** IANA zone of your users, for the "Now:" line of the prompt. Default: UTC only. */
+  timeZone?: string;
   /** Wait between delivery retries. Default 300000 (5 min). An error's retryAfterMs overrides one wait. */
   retryMs?: number;
   /** Delivery attempts before giving up. Default 12. */
@@ -290,7 +385,11 @@ export interface NothingOwedOptions {
   userLabel?: string;
   /** Where the scheduler state lives. Default: memory. */
   store?: Store;
-  /** Resume the SAME conversation/session with `prompt` and return the agent's reply. */
+  /**
+   * Resume the SAME conversation/session with `prompt` and return the agent's reply. Serialize it
+   * with your user turns (onTurnStart / isChecking). It must not send anything itself: the package
+   * sends what it returns.
+   */
   runTurn(conversationId: string, prompt: string, ctx: TurnContext): Promise<string | TurnResult>;
   /**
    * Send a package-made text to the user. It counts as delivered only if it resolves: throw when
@@ -301,15 +400,21 @@ export interface NothingOwedOptions {
   deliver(conversationId: string, text: string, meta: DeliveryMeta): unknown | Promise<unknown>;
   /** Return true for an error that will never succeed; retrying stops at once. */
   isPermanentError?(error: unknown): boolean;
+  /** Return true for a reply that must never reach the user (failed check). Default: tool-call markup (isJunkReply). */
+  isJunk?(text: string): boolean;
+  /** Called right before each model turn (check or report). Serialize it with your user turns. */
+  onTurnStart?(conversationId: string, ctx: Omit<TurnContext, 'signal'>): unknown | Promise<unknown>;
+  /** Called after each model turn, also when it failed or timed out. */
+  onTurnEnd?(conversationId: string, ctx: Omit<TurnContext, 'signal'>): unknown | Promise<unknown>;
   /** A tracked job ended. If given, the package calls it instead of its own report turn. Note your reply with { kind: 'report' }. */
   onJobFinished?(conversationId: string, job: FinishedJob): unknown | Promise<unknown>;
   /** start() found these jobs in the store. Return the ids the host still runs; the rest finish as 'lost'. Default: none kept. */
   onStartJobs?(jobs: TrackedJob[]): Array<string> | Promise<Array<string>>;
-  /** The fixed line sent when checks are exhausted with no answer for the user. */
+  /** The code-written lines (give-up, still running, limits). */
   giveUpText?(ctx: GiveUpContext): string;
   /** Your own send log. Omit it to use the built-in delivered log (noteDelivered). */
   getDelivered?(conversationId: string, sinceMs: number): TimedText[] | Promise<TimedText[]>;
-  /** Return true while the user is mid-conversation; checks and report turns yield and retry. */
+  /** Return true while the user is mid-conversation; checks and report turns yield and retry. No turn slot is held while it runs. */
   isUserBusy?(conversationId: string): boolean | Promise<boolean>;
   /** Every scheduler event. */
   onEvent?(event: NothingOwedEvent): void;
@@ -341,15 +446,21 @@ export interface NothingOwed {
   noteUserMessage(conversationId: string): number;
   messageCount(conversationId: string): number;
   noteDelivered(conversationId: string, text: string, atOrOpts?: number | { at?: number; id?: string | number }): TimedText;
-  /** "Missed: <full text>" notices owed in this conversation, each returned once. Send them before your next message. */
+  /** "Missed:" notices owed in this conversation, each returned once (their timers are cancelled). Send them before your next message. */
   flushMissed(conversationId: string): string[];
+  /** True while a model turn (check or report) runs for this conversation. */
+  isChecking(conversationId: string): boolean;
   trackJob(conversationId: string, jobId: string, opts?: { title?: string }): TrackedJob;
-  /** Resolves after the report (or onJobFinished) and any unparked check ran, or once they wait; null for an unknown job. */
+  /** Resolves at once with the finished job (null for an unknown job). The report runs in the background: watch report_delivered, report_fallback, report_done. */
   finishJob(jobId: string, opts?: { status?: 'done' | 'error' | 'stopped' | 'lost' | string; text?: string }): Promise<FinishedJob | null>;
   /** trackJob, await the work, finishJob with its result or error message, return the result (or rethrow). */
   wrapJob<T>(conversationId: string, jobId: string, work: Promise<T> | (() => Promise<T> | T), opts?: { title?: string }): Promise<T>;
+  /** Loads the store (notes made earlier are merged), takes its lock, arms the timer. */
   start(): Promise<NothingOwed>;
-  stop(): void;
+  /** Stops the timer and writes the final state (sync when the store can). */
+  stop(): Promise<void>;
+  /** Write a debounced state change now. */
+  flush(): Promise<void>;
   tick(): Promise<Array<Outcome | 'busy' | 'capped' | 'report'>>;
   idle(): Promise<void>;
   pending(): CheckRecord[];
@@ -358,6 +469,8 @@ export interface NothingOwed {
   jobs(): TrackedJob[];
   reports(): ReportRecord[];
   outbox(): OutboxItem[];
+  missed(): Array<{ conversationId: string; text: string; due: number }>;
+  circuit(): { open: boolean; fails: number; until: number };
   readonly deliveredLog: DeliveredLog;
 }
 
@@ -369,9 +482,12 @@ export declare function parseCheckReply(text: string, opts?: { failTexts?: strin
 export declare function stripStillRunning(text: string): string;
 /** Flatten whitespace; a text longer than max keeps its head and tail joined by " … ". */
 export declare function clipText(text: string, max?: number): string;
-export declare function defaultGiveUpText(ctx: { reason?: 'failed' | 'still_running' }): string;
+export declare function defaultGiveUpText(ctx: { reason?: GiveUpContext['reason']; until?: number }): string;
+/** True for tool-call markup returned as text: a line starting with "<｜", or "invoke name=", "<tool_call", "<function_calls>". */
+export declare function isJunkReply(text: string): boolean;
 /** "<title> <status>: <first line of output, 300 chars>" */
 export declare function fallbackReportText(job: { id: string; title?: string; status?: string; text?: string }): string;
+/** Atomic JSON file store; `<path>.delivered.json` holds the delivered log and `<path>.lock` the owning process. */
 export declare function createFileStore(path: string): Store & { path: string };
 export declare function createMemoryStore(initial?: StoredState | CheckRecord[]): Store;
 export declare function createDeliveredLog(opts?: DeliveredLogOptions): DeliveredLog;

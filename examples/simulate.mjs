@@ -9,8 +9,8 @@
 // delivered list, sees the summary is missing, and sends it.
 //
 // Part 2: the user asks for a long render. The host links the render to the conversation with
-// wrapJob(). The check at minute 5 answers STILL_RUNNING and parks on the job: no more model
-// wakes while it runs. When the render ends, one report turn tells the user what it produced,
+// wrapJob(). The check answers STILL_RUNNING; with an open job it checks once more 5 "minutes"
+// later, then parks on the job: no more model wakes while it runs. When the render ends, one report turn tells the user what it produced,
 // and the parked check runs once to confirm nothing else is owed. Five "minutes" after each
 // delivery the package makes, one verify check reads it back in case it held a new promise.
 import { createNothingOwed } from 'nothing-owed';
@@ -78,7 +78,8 @@ owed = createNothingOwed({
     if (e.type === 'nothing_owed') log('check', 'NOTHING_OWED: nothing sent');
     if (e.type === 'delivered') log('check', 'owed item delivered');
     if (e.type === 'job_tracked') log('job', `tracked: ${e.title}`);
-    if (e.type === 'parked') log('check', `STILL_RUNNING with an open job: parked on ${e.jobIds.join(', ')}, no wakes until it ends`);
+    if (e.type === 'still_running') log('check', 'STILL_RUNNING');
+    if (e.type === 'parked') log('check', `an open job: parked on ${e.jobIds.join(', ')}, no wakes until it ends`);
     if (e.type === 'job_finished') log('job', `finished: ${e.status}`);
     if (e.type === 'unparked') log('check', 'unparked: runs once now');
     if (e.type === 'verify_scheduled') log('timer', 'verify check in 5 min on what was just delivered');
@@ -104,5 +105,5 @@ await owed.idle();
 await sleep(5.5); // the verify check on the report
 await owed.idle();
 
-owed.stop();
+await owed.stop();
 log('done', `one dropped promise caught, one long job reported; ${wakes} model wakes in total`);

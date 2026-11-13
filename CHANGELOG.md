@@ -4,9 +4,73 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - 2026-11-13
+## [0.4.0] - 2026-11-13
 
-Every promise is delivered, or the user is told plainly that it was not.
+Fixes from a second independent review and from a replay of the v0.3 prompt on two real models.
+The v0.4 prompt itself has not been replayed on a real model yet.
+
+### Changed
+
+- **Missed notices have their own timer** (15 minutes, doubling to 6 hours) until they land or
+  the host takes them with `flushMissed()`; no fresh model check after a give-up. The prompt lists
+  them as "Failed to send - write it again if still needed", never as queued. One sender per
+  conversation (they could go out twice).
+- **The duplicate guard** only compares with copies delivered since the check last ran or in the
+  last 10 minutes, plus queued and missed texts. Dated checks are never compared (a daily reminder
+  was dropped on days 2 to 5); reports only against the same job.
+- **Failed checks always take the recheck ladder**; they no longer park on an unrelated open job.
+  `STILL_RUNNING` with an open job checks once more `delayMs` later, then parks.
+- **The give-up line no longer claims a promise:** "I may have said I'd follow up on something,
+  and I couldn't check it. Ask me if anything is still open." At most once per conversation per
+  outage. All code-written lines go through `giveUpText(ctx)` with `ctx.reason` `failed`,
+  `still_running`, `verify_capped`, `daily_cap` or `due_limit`.
+- **Daily caps:** one code-written line per conversation per day when the cap is reached (it used
+  to wait silently until UTC midnight); `dailyCapReserve` (10) keeps turns for window and dated
+  checks.
+- **`finishJob` and `wrapJob` resolve at once**; the report runs in the background (events
+  `report_delivered`, `report_fallback`, `report_done`). A report is marked delivered in the store
+  before it is sent, so a crash after the send never repeats it.
+- **The delivered log lives with the store by default** (`<path>.delivered.json` next to a file
+  store, a shared map in a memory store), so a restart does not resend what was delivered. File
+  logs write on a 100 ms debounce and flush when the process exits.
+- **State:** nothing is saved before `start()` has loaded (a note before it used to wipe the store);
+  earlier notes are merged. Writes are debounced (`saveDebounceMs`, 100 ms) and `stop()` writes the
+  final state synchronously when the store can; `stop()` now returns a promise. The file store
+  saves atomically and asynchronously, never lets an older write land last, and takes a lock file
+  that refuses a second live process. Store `version: 4`.
+- **Parser:** code fences and `<think>` blocks are removed; markers count on the first line or among
+  the last two, with a `Status:` label; all marker lines are stripped; `STILL_RUNNING` with `DUE`
+  keeps both (the outcome `due` carries `running: true`); `DUE` is upper-case only, needs a zone,
+  may sit in `<...>` with a short note; a first-line `NOTHING_OWED` followed by content, or
+  `NOTHING_OWED except ...`, delivers the content; a STILL_RUNNING token in a sentence is sent as
+  "still running"; contradicting markers keep the check open.
+- **Prompt:** "Now (UTC): ..." or, with `timeZone`, "Now: <local> (<zone>), <UTC>"; DUE asked in UTC
+  with `Z`; file entries like `[photo]` explained, no attachments from this turn, never claim a send
+  that is not in the delivered list; "may be incomplete" when the send log does not reach back far
+  enough.
+- `noteDelivered` never throws into the host's send path.
+
+### Added
+
+- `callbackTimeoutMs` (30 s) for `deliver`, `isUserBusy`, `getDelivered`, `onJobFinished`,
+  `onStartJobs` and the turn hooks; no turn slot is held while `isUserBusy` or `getDelivered`
+  runs; a timed-out `deliver` goes to the outbox.
+- Circuit breaker: `circuitFailures` (5), `circuitPauseMs` (15 min), `circuitMaxPauseMs` (2 h);
+  events `circuit_open`, `circuit_closed`; `circuit()`.
+- `maxDueDepth` (10) and `maxDatedPerConversation` (5); event `due_limit`.
+- `globalDailyCap` (1000); event `global_daily_cap`.
+- `maxConcurrentLimit` (8): turn slots grow by one per 25 waiting turns.
+- `onTurnStart`, `onTurnEnd`, `isChecking()`.
+- `isJunk` (default `isJunkReply()`): tool-call markup returned as text is a failed check.
+- `timeZone`; `busyStuckMs` (30 min, event `busy_stuck`); `missedRetryMs`, `missedMaxRetryMs`;
+  `idlePruneMs` (30 days); `saveDebounceMs`; `flush()`, `missed()`.
+- The verify-chain cap sends a "no longer watched" line (once a day per conversation).
+- No verify check after a delivery that also set a DUE timer.
+
+## [0.3.0] - 2026-11-13 (not published)
+
+Aimed at delivering every promise or telling the user plainly that it was not. A second review
+found several ways it still lost or repeated messages; see 0.4.0.
 
 ### Changed
 

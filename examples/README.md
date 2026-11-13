@@ -16,3 +16,7 @@ throw from `deliver` when the platform did not confirm the send. The package cou
 own deliveries, so logging them again in your send path is harmless. Send what `flushMissed(id)`
 returns before your next normal message, and pass `ctx.signal` to your model call so a check that
 runs past `turnTimeoutMs` is really stopped.
+
+The check turn resumes the same session as the user's turns: never run both at once (use
+`isUserBusy`, `onTurnStart`/`onTurnEnd` and `isChecking`), and make sure `runTurn` only returns
+the agent's text. It must not post anything to the chat itself.
