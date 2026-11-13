@@ -11,7 +11,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-339933.svg)](./package.json)
-[![CI: node --test](https://img.shields.io/badge/CI-node%20--test%20on%2018%20%7C%2020%20%7C%2022-informational.svg)](./.github/workflows/ci.yml)
+[![CI](https://github.com/muziksociety/nothing-owed/actions/workflows/ci.yml/badge.svg)](https://github.com/muziksociety/nothing-owed/actions/workflows/ci.yml)
 ![Zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
 
 ```mermaid
