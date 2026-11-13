@@ -22,7 +22,38 @@ const DAY_MS = 24 * 60 * MIN_MS;
 const ECHO_MS = MIN_MS; // a package delivery routed back through noteReply within this long is an echo
 const DUP_WINDOW_MS = 10 * MIN_MS;
 const OWN_KEEP = 20;
-const LOST_TEXT = 'the work was interrupted by a restart';
+
+/**
+ * Every user-visible string the package writes itself, in English. Pass a (partial) set as the
+ * `strings` option to replace them; `status` and `giveUp` merge key by key. Templates fill
+ * {title}, {status}, {line} and {time}.
+ */
+export const defaultStrings = Object.freeze({
+  missedPrefix: 'Missed: ',
+  fallbackReport: '{title} {status}: {line}',
+  fallbackReportNoLine: '{title} {status}.',
+  status: Object.freeze({ done: 'done', error: 'error', stopped: 'stopped', lost: 'lost' }),
+  lostText: 'the work was interrupted by a restart',
+  giveUp: Object.freeze({
+    failed: "I may have said I'd follow up on something, and I couldn't check it. Ask me if anything is still open.",
+    still_running: "Something I started for you may still be running, and I'm no longer watching it. Ask me if you need an update.",
+    verify_capped: "I'm no longer watching this for you automatically. Ask me if anything is still open.",
+    daily_cap: "I've hit today's limit for checking on promises; I'll check again at {time} UTC.",
+    due_limit: "I can't hold another reminder here. Ask me again closer to the time.",
+  }),
+});
+
+const mergeStrings = (s) => {
+  if (!s || s === defaultStrings) return defaultStrings;
+  return {
+    ...defaultStrings,
+    ...s,
+    status: { ...defaultStrings.status, ...(s.status || {}) },
+    giveUp: { ...defaultStrings.giveUp, ...(s.giveUp || {}) },
+  };
+};
+// one pass, so a placeholder inside a value (a job title with "{line}") is never expanded
+const fill = (template, values) => String(template).replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
 
 const noop = () => {};
 const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
@@ -36,20 +67,25 @@ const hhmm = (t) => new Date(t).toISOString().slice(11, 16);
 /**
  * The default code-written lines. `reason`: 'failed' (checks kept failing), 'still_running' (the
  * last check had nothing but STILL_RUNNING), 'verify_capped', 'daily_cap' (with `until`) or
- * 'due_limit'. None of them claims a promise was made.
+ * 'due_limit'. None of them claims a promise was made. `strings`: a (partial) strings set.
  */
-export function defaultGiveUpText({ reason, until } = {}) {
+export function defaultGiveUpText({ reason, until } = {}, strings) {
+  const g = mergeStrings(strings).giveUp;
   switch (reason) {
-    case 'still_running': return "Something I started for you may still be running, and I'm no longer watching it. Ask me if you need an update.";
-    case 'verify_capped': return "I'm no longer watching this for you automatically. Ask me if anything is still open.";
-    case 'daily_cap': return `I've hit today's limit for checking on promises; I'll check again at ${hhmm(until)} UTC.`;
-    case 'due_limit': return "I can't hold another reminder here. Ask me again closer to the time.";
-    default: return "I may have said I'd follow up on something, and I couldn't check it. Ask me if anything is still open.";
+    case 'still_running': return g.still_running;
+    case 'verify_capped': return g.verify_capped;
+    case 'daily_cap': return fill(g.daily_cap, { time: hhmm(until) });
+    case 'due_limit': return g.due_limit;
+    default: return g.failed;
   }
 }
 
-/** The code-written report for a job whose report turn failed or declined: "<title> <status>: <first line>". */
-export function fallbackReportText(job) {
+/**
+ * The code-written report for a job whose report turn failed or declined: "<title> <status>: <first
+ * line>" by default. `strings`: a (partial) strings set (templates and status words).
+ */
+export function fallbackReportText(job, strings) {
+  const S = mergeStrings(strings);
   let source = job?.summary ?? job?.text ?? '';
   const raw = String(source).trim();
   if (job?.summary == null && /^[[{]/.test(raw)) {
@@ -57,8 +93,9 @@ export function fallbackReportText(job) {
     try { const v = JSON.parse(raw); source = typeof v?.text === 'string' ? v.text : typeof v?.summary === 'string' ? v.summary : ''; } catch { /* plain text */ }
   }
   const line = String(source).split(/\r?\n/).map((s) => s.trim()).find(Boolean) || '';
-  const head = `${job?.title || job?.id} ${job?.status || 'done'}`;
-  return line ? `${head}: ${line.slice(0, 300)}` : `${head}.`;
+  const status = job?.status || 'done';
+  const values = { title: job?.title || job?.id, status: Object.hasOwn(S.status, status) ? S.status[status] : status, line: line.slice(0, 300) };
+  return fill(line ? S.fallbackReport : S.fallbackReportNoLine, values);
 }
 
 /**
@@ -110,7 +147,9 @@ export function createNothingOwed(options = {}) {
     onStartJobs,
     onTurnStart,
     onTurnEnd,
-    giveUpText = defaultGiveUpText,
+    giveUpText,
+    strings: stringsOpt,
+    promptLanguage,
     onEvent = noop,
     onUsage,
     failTexts = [],
@@ -128,6 +167,8 @@ export function createNothingOwed(options = {}) {
 
   if (typeof runTurn !== 'function') throw new TypeError('nothing-owed: runTurn(conversationId, prompt) is required');
   if (typeof deliver !== 'function') throw new TypeError('nothing-owed: deliver(conversationId, text) is required');
+  const S = mergeStrings(stringsOpt);
+  const missedLine = (text) => `${S.missedPrefix}${text}`;
 
   // Timed rechecks: maxRechecks at delayMs, then one per back-off step. The last one asks for a status.
   const totalRechecks = maxRechecks + backoffMs.length;
@@ -473,7 +514,7 @@ export function createNothingOwed(options = {}) {
       const m = missed[cid][0];
       if (!force && m.due > now()) return true;
       try {
-        await sendOnce(cid, `Missed: ${m.text}`, { kind: 'missed' });
+        await sendOnce(cid, missedLine(m.text), { kind: 'missed' });
       } catch (error) {
         m.wait = Math.min((m.wait || missedRetryMs) * 2, missedMaxRetryMs);
         m.due = now() + m.wait;
@@ -553,7 +594,9 @@ export function createNothingOwed(options = {}) {
   // A code-written line to the user (never a model turn).
   const sendLine = async (cid, reason, ids = {}, extra = {}) => {
     let text;
-    try { text = giveUpText({ conversationId: cid, reason, ...ids, ...extra }); } catch { text = defaultGiveUpText({ reason, ...extra }); }
+    try {
+      text = giveUpText ? giveUpText({ conversationId: cid, reason, ...ids, ...extra }) : defaultGiveUpText({ reason, ...extra }, S);
+    } catch { text = defaultGiveUpText({ reason, ...extra }, S); }
     text = String(text ?? '').trim();
     if (!text) return false;
     const sent = await deliverOwed(cid, text, { kind: 'giveup', ...ids });
@@ -581,7 +624,7 @@ export function createNothingOwed(options = {}) {
     if (mode === 'due') return false;
     const f = flat(body);
     if (!f) return false;
-    const same = (t) => { const x = flat(t); return x === f || x === `Missed: ${f}`; };
+    const same = (t) => { const x = flat(t); return x === f || x === flat(missedLine(f)); };
     if (mode === 'report') {
       return outbox.some((o) => o.conversationId === cid && o.jobId === jobId && same(o.text)) ||
         (own.get(cid) || []).some((e) => e.done && e.jobId === jobId && same(e.text));
@@ -799,7 +842,7 @@ export function createNothingOwed(options = {}) {
           failed: (missed[cid] || []).map((m) => ({ at: m.at ?? now(), text: m.text })),
           deliveredSince: horizon != null && rec.since < horizon ? horizon : undefined,
           isLastCheck, userLabel, maxTextLength, maxDelivered: maxDeliveredInPrompt,
-          messageCount: counters[cid] || 0, now: now(), timeZone: zoneOf(cid), reason, dueAt: rec.dueAt,
+          messageCount: counters[cid] || 0, now: now(), timeZone: zoneOf(cid), reason, dueAt: rec.dueAt, language: promptLanguage,
         });
         emit({ type: 'check_started', conversationId: cid, checkId: rec.id, replies: rec.replies.length, delivered: delivered.length, recheck: rechecks, isLastCheck, reason });
 
@@ -885,7 +928,7 @@ export function createNothingOwed(options = {}) {
   }
 
   async function reportFallback(rep, reason) {
-    const sent = await sendReport(rep, fallbackReportText(rep.job), 'fallback');
+    const sent = await sendReport(rep, fallbackReportText(rep.job, S), 'fallback');
     emit({ type: 'report_fallback', conversationId: rep.conversationId, jobId: rep.job.id, reason, delivered: sent.ok });
   }
 
@@ -929,7 +972,7 @@ export function createNothingOwed(options = {}) {
       let body = '';
       let dueAt;
       try {
-        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt });
+        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt, language: promptLanguage });
         let res;
         try {
           res = await callTurn(cid, prompt, { kind: 'report', jobId: job.id, checkId: null, recheck: rep.attempts || 0, isLastCheck: false, reason: 'report' });
@@ -962,7 +1005,7 @@ export function createNothingOwed(options = {}) {
       }
 
       if (outcome === 'due' && validDue(dueAt)) {
-        addDated({ conversationId: cid, replies: [{ at: now(), text: clipText(body || fallbackReportText(job), maxTextLength), seq: counters[cid] }], depth: 0 }, dueAt);
+        addDated({ conversationId: cid, replies: [{ at: now(), text: clipText(body || fallbackReportText(job, S), maxTextLength), seq: counters[cid] }], depth: 0 }, dueAt);
       }
       const carries = (outcome === 'deliver' || outcome === 'deliver_running' || outcome === 'due') && body;
       if (!carries && outcome === 'nothing' && (lastHostReply[cid] ?? -Infinity) >= (job.finishedAt ?? Infinity)) {
@@ -1061,7 +1104,7 @@ export function createNothingOwed(options = {}) {
       const list = missed[cid] || [];
       delete missed[cid];
       if (list.length) { void save(); arm(); }
-      return list.map((m) => `Missed: ${m.text}`);
+      return list.map((m) => missedLine(m.text));
     },
 
     /** True while a model turn (check or report) runs for this conversation. */
@@ -1205,7 +1248,7 @@ export function createNothingOwed(options = {}) {
       });
       for (const j of lost) {
         emit({ type: 'job_lost', conversationId: j.conversationId, jobId: j.id });
-        void api.finishJob(j.id, { status: 'lost', text: LOST_TEXT });
+        void api.finishJob(j.id, { status: 'lost', text: S.lostText });
       }
       return api;
     },

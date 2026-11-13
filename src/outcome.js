@@ -28,6 +28,7 @@ function nowLine(t, timeZone) {
   return `Now (UTC): ${iso(t)}.`;
 }
 
+const languageLine = (u, language) => `Write anything for ${u} in ${language}.`;
 const back = (n) => (n === 1 ? '1 message back' : `${n} messages back`);
 const hasSeq = (items) => items.some((x) => x.seq != null);
 
@@ -60,6 +61,7 @@ const list = (items, max, messageCount) =>
  * @param {string}  [input.timeZone]     IANA zone of the user (e.g. 'America/New_York'): the time is shown in it too
  * @param {'window'|'recheck'|'verify'|'due'|'park_timeout'} [input.reason] why this check runs
  * @param {number}  [input.dueAt]        on a dated check: the time the agent set
+ * @param {string}  [input.language]     e.g. 'Spanish': adds "Write anything for the user in Spanish."
  * @returns {string}
  */
 export function buildPrompt({
@@ -77,6 +79,7 @@ export function buildPrompt({
   timeZone,
   reason,
   dueAt,
+  language,
 }) {
   const u = userLabel;
   const lines = [`[Check from the system, not from ${u}.`];
@@ -120,8 +123,9 @@ export function buildPrompt({
   lines.push(
     `If you promised something for a later time (a reminder, "I will check again at 9"), reply with the line DUE <time in UTC, ISO 8601 ending in Z>, for example DUE 2030-01-01T09:00:00Z, alone or as the last line after what you deliver now; the check comes back at that time. Text before it is sent to ${u}, so do not add a status note about the timer.`,
     `If you owe nothing, or all of it is in the delivered list, reply with exactly ${NOTHING_OWED}.`,
-    `Do not wait in this turn: no sleeping, no polling loops, no watching files or processes.]`,
   );
+  if (language) lines.push(languageLine(u, language));
+  lines.push(`Do not wait in this turn: no sleeping, no polling loops, no watching files or processes.]`);
   return lines.join('\n');
 }
 
@@ -133,9 +137,10 @@ export function buildPrompt({
  * @param {string} [input.userLabel]
  * @param {number} [input.maxTextLength] bound the job's output to this many characters (default 1500)
  * @param {{at:number,text:string}[]} [input.delivered] what reached the user since the job ended
+ * @param {string} [input.language] e.g. 'Spanish': adds "Write anything for the user in Spanish."
  * @returns {string}
  */
-export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40 }) {
+export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40, language }) {
   const u = userLabel;
   const shown = delivered.slice(-Math.max(1, maxDelivered));
   return [
@@ -146,6 +151,7 @@ export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength =
     `Messages the host delivered to ${u} since the job ended:`,
     list(shown, 300, 0),
     `If those messages already give ${u} what it produced, reply with exactly ${NOTHING_OWED}.`,
+    ...(language ? [languageLine(u, language)] : []),
     `Otherwise tell ${u} in a few lines what it produced and what is still open. No waiting in this turn.]`,
   ].join('\n');
 }

@@ -311,6 +311,8 @@ export interface BuildPromptInput {
   reason?: CheckReason;
   /** Dated checks: the time the agent set. */
   dueAt?: number;
+  /** e.g. 'Spanish': adds the line "Write anything for the user in Spanish." */
+  language?: string;
 }
 
 export interface BuildReportPromptInput {
@@ -321,7 +323,34 @@ export interface BuildReportPromptInput {
   userLabel?: string;
   /** Bound the job's output to this many characters (head and tail). Default 1500. */
   maxTextLength?: number;
+  /** e.g. 'Spanish': adds the line "Write anything for the user in Spanish." */
+  language?: string;
 }
+
+/**
+ * Every user-visible string the package writes itself. Templates fill {title}, {status}, {line}
+ * and {time}; a placeholder inside a filled value is never expanded.
+ */
+export interface NothingOwedStrings {
+  /** Before a delivery that was given up on. Default "Missed: ". */
+  missedPrefix: string;
+  /** The code-written job report. Default "{title} {status}: {line}". */
+  fallbackReport: string;
+  /** The same, when the job returned no usable line. Default "{title} {status}.". */
+  fallbackReportNoLine: string;
+  /** The word for each job status in the code-written report; an unknown status is used as it is. */
+  status: { done: string; error: string; stopped: string; lost: string; [status: string]: string };
+  /** The output of a job that died in a restart. Default "the work was interrupted by a restart". */
+  lostText: string;
+  /** The code-written lines, by reason. daily_cap fills {time} (HH:MM, UTC). */
+  giveUp: Record<GiveUpContext['reason'], string>;
+}
+
+/** A partial set: missing keys (and missing keys of status and giveUp) keep the English default. */
+export type NothingOwedStringsInput = Partial<Omit<NothingOwedStrings, 'status' | 'giveUp'>> & {
+  status?: Partial<NothingOwedStrings['status']>;
+  giveUp?: Partial<NothingOwedStrings['giveUp']>;
+};
 
 export interface NothingOwedOptions {
   /** The check fires this long after the first reply of a window; later replies never move it. Also the recheck and verify delay. Default 300000 (5 min). */
@@ -418,8 +447,12 @@ export interface NothingOwedOptions {
   onJobFinished?(conversationId: string, job: FinishedJob): unknown | Promise<unknown>;
   /** start() found these jobs in the store. Return the ids the host still runs; the rest finish as 'lost'. Default: none kept. */
   onStartJobs?(jobs: TrackedJob[]): Array<string> | Promise<Array<string>>;
-  /** The code-written lines (give-up, still running, limits). */
+  /** The code-written lines (give-up, still running, limits). Wins over strings.giveUp. */
   giveUpText?(ctx: GiveUpContext): string;
+  /** Replace any user-visible string (see defaultStrings). Default: English. */
+  strings?: NothingOwedStringsInput;
+  /** e.g. 'Spanish': the check and report prompts add "Write anything for the user in Spanish." Default: none. */
+  promptLanguage?: string;
   /** Your own send log. Omit it to use the built-in delivered log (noteDelivered). */
   getDelivered?(conversationId: string, sinceMs: number): TimedText[] | Promise<TimedText[]>;
   /** Return true while the user is mid-conversation; checks and report turns yield and retry. No turn slot is held while it runs. */
@@ -490,11 +523,13 @@ export declare function parseCheckReply(text: string, opts?: { failTexts?: strin
 export declare function stripStillRunning(text: string): string;
 /** Flatten whitespace; a text longer than max keeps its head and tail joined by " … ". */
 export declare function clipText(text: string, max?: number): string;
-export declare function defaultGiveUpText(ctx: { reason?: GiveUpContext['reason']; until?: number }): string;
+export declare function defaultGiveUpText(ctx: { reason?: GiveUpContext['reason']; until?: number }, strings?: NothingOwedStringsInput): string;
+/** The English defaults of every user-visible string (frozen). */
+export declare const defaultStrings: Readonly<NothingOwedStrings>;
 /** True for tool-call markup returned as text: a line starting with "<｜", or "invoke name=", "<tool_call", "<function_calls>". */
 export declare function isJunkReply(text: string): boolean;
 /** "<title> <status>: <first line of output, 300 chars>" */
-export declare function fallbackReportText(job: { id: string; title?: string; status?: string; text?: string }): string;
+export declare function fallbackReportText(job: { id: string; title?: string; status?: string; text?: string; summary?: string }, strings?: NothingOwedStringsInput): string;
 /** Atomic JSON file store; `<path>.delivered.json` holds the delivered log and `<path>.lock` the owning process. */
 export declare function createFileStore(path: string): Store & { path: string };
 export declare function createMemoryStore(initial?: StoredState | CheckRecord[]): Store;
