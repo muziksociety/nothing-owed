@@ -11,4 +11,5 @@ The examples import `nothing-owed` by name. Inside this repository that resolves
 package itself (Node package self-reference), so they run from a clone without installing.
 
 The rule all adapters share: call `noteDelivered` only after the transport confirmed the
-send, and call `noteReply` for the agent's normal replies (not for check replies).
+send, and call `noteReply` for the agent's normal replies (not for check replies or job reports), `noteUserMessage`
+for each user message, and throw from `deliver` when the platform did not confirm the send.

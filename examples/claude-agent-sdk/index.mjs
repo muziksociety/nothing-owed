@@ -42,5 +42,5 @@ async function onUserMessage(conversationId, text) {
 }
 
 await onUserMessage('chat-42', 'Summarize https://example.com/v/123 and send it to me when done.');
-console.log('Check scheduled in 10 minutes. Keep this process running to see it fire.');
+console.log('Check scheduled in 5 minutes. Keep this process running to see it fire.');
 setInterval(() => {}, 60_000); // the scheduler's timer is unref'd

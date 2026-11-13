@@ -63,6 +63,6 @@ const { text } = await turn('chat-42', 'Say hello, and promise to send a fun fac
 console.log(`[to user in chat-42] ${text}`);
 owed.noteDelivered('chat-42', text);
 owed.noteReply('chat-42', text);
-console.log('Check scheduled in 10 minutes. Keep this process running to see it fire.');
+console.log('Check scheduled in 5 minutes. Keep this process running to see it fire.');
 // Keep the process alive until the check runs (the scheduler's timer is unref'd).
 setInterval(() => {}, 60_000);
