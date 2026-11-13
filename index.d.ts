@@ -265,7 +265,7 @@ export type NothingOwedEvent =
   | { type: 'delivery_failed'; at: number; conversationId: string; kind: DeliveryKind; checkId?: string; jobId?: string; attempts: number; permanent: boolean; error: unknown }
   | { type: 'missed_notice'; at: number; conversationId: string }
   | ({ type: 'usage'; at: number } & UsageInfo)
-  | { type: 'error'; at: number; stage: 'store' | 'check' | 'isUserBusy' | 'getDelivered' | 'report' | 'onJobFinished' | 'onStartJobs' | 'onTurnStart' | 'onTurnEnd' | 'deliver' | 'deliveredLog'; conversationId?: string; checkId?: string; jobId?: string; error: unknown }
+  | { type: 'error'; at: number; stage: 'store' | 'check' | 'isUserBusy' | 'getDelivered' | 'report' | 'onJobFinished' | 'onStartJobs' | 'onTurnStart' | 'onTurnEnd' | 'deliver' | 'deliveredLog' | 'userNotifiedOnError'; conversationId?: string; checkId?: string; jobId?: string; error: unknown }
   | { type: 'started'; at: number; pending: number; parked: number; dated: number; jobs: number; lost: number; reports: number; outbox: number }
   | { type: 'stopped'; at: number };
 

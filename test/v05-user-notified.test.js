@@ -331,3 +331,19 @@ test('missed notices stored without a jobId (before v0.5.1) still load and are n
   assert.equal(w.no.noteJobUserNotified('j'), false);
   assert.deepEqual(w.no.flushMissed(C), ['Missed: old text']);
 });
+
+test('a userNotifiedOnError callback that throws: an error event, the report runs, the original error is rethrown', async () => {
+  const w = await five({ reply: 'The export failed.' });
+  const bad = new Error('callback broke');
+  await assert.rejects(
+    w.no.wrapJob(C, 'w', () => Promise.reject(new Error('disk full')), { userNotifiedOnError: () => { throw bad; } }),
+    /disk full/,
+  );
+  await w.no.idle();
+  const errs = ev(w, 'error').filter((e) => e.stage === 'userNotifiedOnError');
+  assert.equal(errs.length, 1);
+  assert.equal(errs[0].error, bad);
+  assert.equal(errs[0].jobId, 'w');
+  assert.equal(errs[0].conversationId, C);
+  assert.deepEqual(texts(w), ['The export failed.'], 'treated as not notified');
+});

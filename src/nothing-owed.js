@@ -1244,7 +1244,13 @@ export function createNothingOwed(options = {}) {
       } catch (error) {
         // userNotifiedOnError: the host's own error path tells the user (true, or per error)
         let userNotified = false;
-        try { userNotified = typeof userNotifiedOnError === 'function' ? !!userNotifiedOnError(error) : !!userNotifiedOnError; } catch { userNotified = false; }
+        try {
+          userNotified = typeof userNotifiedOnError === 'function' ? !!userNotifiedOnError(error) : !!userNotifiedOnError;
+        } catch (cbError) {
+          // a broken callback never hides the job's own error: treated as not notified, and reported
+          userNotified = false;
+          emit({ type: 'error', stage: 'userNotifiedOnError', conversationId: String(conversationId), jobId: String(jobId), error: cbError });
+        }
         await api.finishJob(jobId, { status: 'error', text: error?.message ?? String(error), userNotified });
         throw error;
       }
