@@ -1,0 +1,47 @@
+{
+  "name": "nothing-owed",
+  "version": "0.1.0",
+  "description": "A timer on every agent reply: the agent audits its own conversation against what really reached the user, and delivers what it still owes.",
+  "license": "MIT",
+  "author": "muziksociety",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "index.d.ts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "simulate": "node examples/simulate.mjs"
+  },
+  "keywords": [
+    "llm",
+    "agent",
+    "ai-agent",
+    "follow-up",
+    "commitments",
+    "promises",
+    "chatbot",
+    "telegram",
+    "claude",
+    "self-audit",
+    "scheduler",
+    "reliability"
+  ],
+  "repository": "github:muziksociety/nothing-owed",
+  "sideEffects": false
+}
