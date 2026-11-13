@@ -297,7 +297,7 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 | `onJobFinished(id, job)` | report turn | Deliver a finished job's result yourself instead of the report turn. |
 | `onStartJobs(jobs)` | keep none | Jobs found in the store at `start()`: return the ids your host still runs; the rest finish as `lost`. |
 | `giveUpText(ctx)` | built-in lines | The code-written lines; `ctx.reason` is `failed`, `still_running`, `verify_capped`, `daily_cap` (with `until`) or `due_limit`. |
-| `strings` | English (`defaultStrings`) | Replace any user-visible string: `missedPrefix`, `fallbackReport` / `fallbackReportNoLine` templates (`{title}`, `{status}`, `{line}`), `status` words, `lostText`, and the `giveUp` lines (`daily_cap` fills `{time}`). A partial set keeps the other defaults; `giveUpText` still wins for the give-up lines. |
+| `strings` | English (`defaultStrings`) | Replace any user-visible string: `missedPrefix`, `fallbackReport` / `fallbackReportNoLine` templates (`{title}`, `{status}`, `{line}`), `status` words, `lostText`, and the `giveUp` lines (`daily_cap` fills `{time}` in UTC and `{localTime}` in the conversation's `timeZone`). A partial set keeps the other defaults; `giveUpText` still wins for the give-up lines. |
 | `promptLanguage` | none | For example `'Spanish'`: the check and report prompts add "Write anything for the user in Spanish." The rest of the prompt stays English. |
 | `dailyCap` | `60` | Model turns per conversation per UTC day (`0` disables). |
 | `onEvent(event)`, `onUsage(info)` | none | Every event (see `index.d.ts`), and turn usage or cost. |

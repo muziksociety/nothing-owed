@@ -219,6 +219,8 @@ export interface GiveUpContext {
   reason: 'failed' | 'still_running' | 'verify_capped' | 'daily_cap' | 'due_limit';
   checkId?: string | null;
   until?: number;
+  /** daily_cap: the conversation's time zone (from the timeZone option), if any. */
+  timeZone?: string;
 }
 
 type Ids = Array<string | number>;
@@ -351,7 +353,7 @@ export interface NothingOwedStrings {
   status: { done: string; error: string; stopped: string; lost: string; [status: string]: string };
   /** The output of a job that died in a restart. Default "the work was interrupted by a restart". */
   lostText: string;
-  /** The code-written lines, by reason. daily_cap fills {time} (HH:MM, UTC). */
+  /** The code-written lines, by reason. daily_cap fills {time} (HH:MM, UTC) and {localTime} (HH:MM in the conversation's time zone, UTC when none). */
   giveUp: Record<GiveUpContext['reason'], string>;
 }
 
@@ -543,7 +545,7 @@ export declare function parseCheckReply(text: string, opts?: { failTexts?: strin
 export declare function stripStillRunning(text: string): string;
 /** Flatten whitespace; a text longer than max keeps its head and tail joined by " … ". */
 export declare function clipText(text: string, max?: number): string;
-export declare function defaultGiveUpText(ctx: { reason?: GiveUpContext['reason']; until?: number }, strings?: NothingOwedStringsInput): string;
+export declare function defaultGiveUpText(ctx: { reason?: GiveUpContext['reason']; until?: number; timeZone?: string }, strings?: NothingOwedStringsInput): string;
 /** The English defaults of every user-visible string (frozen). */
 export declare const defaultStrings: Readonly<NothingOwedStrings>;
 /** True for tool-call markup returned as text: a line starting with "<｜", or "invoke name=", "<tool_call", "<function_calls>". */

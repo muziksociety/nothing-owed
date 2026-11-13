@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] - 2026-11-13
+
+### Added
+
+- `{localTime}` placeholder in the `daily_cap` give-up line: the reset time in the conversation's `timeZone` (UTC when none). `giveUpText` callbacks get `timeZone` in their context. The default English line is unchanged.
+
 ## [0.5.1] - 2026-11-13
 
 From a review of the 0.5.0 change.

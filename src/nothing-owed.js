@@ -26,7 +26,7 @@ const OWN_KEEP = 20;
 /**
  * Every user-visible string the package writes itself, in English. Pass a (partial) set as the
  * `strings` option to replace them; `status` and `giveUp` merge key by key. Templates fill
- * {title}, {status}, {line} and {time}.
+ * {title}, {status}, {line}, {time} (UTC) and {localTime} (daily_cap, in the conversation's time zone).
  */
 export const defaultStrings = Object.freeze({
   missedPrefix: 'Missed: ',
@@ -63,18 +63,25 @@ const copy = (v) => JSON.parse(JSON.stringify(v));
 const isRunning = (o) => o === 'running' || o === 'deliver_running';
 const byDue = (a, b) => a.due - b.due;
 const hhmm = (t) => new Date(t).toISOString().slice(11, 16);
+// hh:mm in a time zone; UTC when none is given or the zone is unknown
+const localHhmm = (t, timeZone) => {
+  if (!timeZone) return hhmm(t);
+  try {
+    return new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(t));
+  } catch { return hhmm(t); }
+};
 
 /**
  * The default code-written lines. `reason`: 'failed' (checks kept failing), 'still_running' (the
  * last check had nothing but STILL_RUNNING), 'verify_capped', 'daily_cap' (with `until`) or
  * 'due_limit'. None of them claims a promise was made. `strings`: a (partial) strings set.
  */
-export function defaultGiveUpText({ reason, until } = {}, strings) {
+export function defaultGiveUpText({ reason, until, timeZone } = {}, strings) {
   const g = mergeStrings(strings).giveUp;
   switch (reason) {
     case 'still_running': return g.still_running;
     case 'verify_capped': return g.verify_capped;
-    case 'daily_cap': return fill(g.daily_cap, { time: hhmm(until) });
+    case 'daily_cap': return fill(g.daily_cap, { time: hhmm(until), localTime: localHhmm(until, timeZone) });
     case 'due_limit': return g.due_limit;
     default: return g.failed;
   }
@@ -603,6 +610,7 @@ export function createNothingOwed(options = {}) {
 
   // A code-written line to the user (never a model turn).
   const sendLine = async (cid, reason, ids = {}, extra = {}) => {
+    if (reason === 'daily_cap') extra = { timeZone: zoneOf(cid), ...extra };
     let text;
     try {
       text = giveUpText ? giveUpText({ conversationId: cid, reason, ...ids, ...extra }) : defaultGiveUpText({ reason, ...extra }, S);
