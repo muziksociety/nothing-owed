@@ -15,19 +15,30 @@
 ![Zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
 
 ```mermaid
-flowchart LR
-    R["Agent replies<br/>in a conversation"] --> T["Check scheduled<br/>5 min later"]
-    R2["More replies<br/>before it fires"] -->|join the list, never move the timer| T
-    T --> B{"User mid-<br/>conversation?"}
-    B -->|yes| W["Wait, try again"] --> B
-    B -->|no| C["Resume the SAME session with:<br/>your replies + the host's<br/>delivered list"]
+flowchart TD
+    R["Agent replies"] --> T["Check window opens:<br/>fires 5 min later, no matter what"]
+    R2["More replies"] -->|join the list,<br/>never move the timer| T
+    T --> B{"User's turn<br/>in progress?"}
+    B -->|yes| W["Wait for it to end"] --> B
+    B -->|no| C["Resume the SAME session with:<br/>replies + messages back<br/>+ the host's delivered list"]
     C --> O{"Agent answers"}
-    O -->|NOTHING_OWED| S["Send nothing"]
-    O -->|STILL_RUNNING| J{"Tracked job<br/>still open?"}
-    J -->|yes| P["Park: no wakes<br/>until the job ends,<br/>then report + check once"]
-    J -->|no| RC["Re-check: 6 x 5 min,<br/>then +15, +30, +60;<br/>+120 asks for a status"] --> B
-    O -->|anything else| D["Deliver it<br/>to the user<br/>(retried if the send fails)"]
+    O -->|NOTHING_OWED| S["Send nothing. Done."]
+    O -->|owed content| D["Deliver it"]
+    O -->|"content + STILL_RUNNING"| D
+    O -->|STILL_RUNNING| J{"Tracked job<br/>open?"}
+    D -->|part still running| J
+    J -->|yes| P["Park: no model wakes"]
+    J -->|no| RC["Recheck: 6 x 5 min,<br/>then +15, +30, +60, +120<br/>(last one: status, then end)"] --> B
+    E(["Code event: job ends<br/>(finishJob / wrapJob)"]) --> RT["One report turn<br/>in the same session"]
+    RT --> D
+    E --> P2["Parked check runs once"] --> B
+    P -.->|"2 h with no end"| ST["One-line status"]
+    D --> X{"Platform confirmed<br/>the send?"}
+    X -->|yes| OK["Delivered. No new timer."]
+    X -->|no| RS["Resend the same text<br/>every 5 min, max 12;<br/>then a short 'Missed' line<br/>with the next message"]
 ```
+
+**Rule of thumb:** code holds every alarm (timers, job-end events, delivery confirmation). The model is only woken to judge and to write. A check's own reply and a job report never start a new timer, so nothing loops.
 
 ## The problem
 
@@ -238,7 +249,8 @@ From a production chat assistant, measured before this package was extracted:
 | Earlier prompt version, without the delivered list | 3 / 4 caught |
 | Cost per check in the replay, cold cache | about **$0.53** |
 | First live check, cold cache | **$0.36** |
-| Live check, warm cache | expected to be a few cents (being measured) |
+| First live check, warm cache (it delivered a 763-character reply) | **$0.035** |
+| Daily cost with the v0.2 fixed window | being measured |
 
 The delivered list is what closed the gap from 3/4 to 4/4: without it, the agent sees a summary in its own context and assumes the user got it.
 
