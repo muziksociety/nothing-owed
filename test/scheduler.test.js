@@ -23,28 +23,28 @@ test('a reply schedules one check delayMs later, and it runs once', async () => 
   assert.equal(w.turns.length, 1, 'no second check without a new reply');
 });
 
-test('a newer reply merges into the pending check and moves the due time', async () => {
+test('a newer reply merges into the pending check without moving the due time', async () => {
   const w = await started();
   w.no.noteReply(C, 'first reply');
   await w.advance(5 * MIN);
   const rec = w.no.noteReply(C, 'second reply');
   assert.equal(rec.replies.length, 2);
   assert.equal(w.no.pending().length, 1);
-  await w.advance(DELAY - 1);
-  assert.equal(w.turns.length, 0, 'due time moved to the newer reply');
+  await w.advance(DELAY - 5 * MIN - 1);
+  assert.equal(w.turns.length, 0);
   await w.advance(1);
-  assert.equal(w.turns.length, 1, 'one check per quiet period');
+  assert.equal(w.turns.length, 1, 'fires at the first reply + delay, one check per window');
   assert.match(w.turns[0].prompt, /first reply/);
   assert.match(w.turns[0].prompt, /second reply/);
   assert.ok(w.types().includes('merged'));
 });
 
-test('a merged check keeps only the newest maxReplies replies', async () => {
+test('a merged check keeps the first reply and the newest ones', async () => {
   const w = world();
   w.no = w.make({ maxReplies: 3 });
   await w.no.start();
   for (let i = 1; i <= 5; i++) w.no.noteReply(C, `reply ${i}`);
-  assert.deepEqual(w.no.pending()[0].replies.map((r) => r.text), ['reply 3', 'reply 4', 'reply 5']);
+  assert.deepEqual(w.no.pending()[0].replies.map((r) => r.text), ['reply 1', 'reply 4', 'reply 5']);
 });
 
 test('NOTHING_OWED sends nothing', async () => {
@@ -192,7 +192,7 @@ test('empty answers and canned failure notices are silent', async () => {
   }
 });
 
-test('a deliver() failure is silent and does not crash the loop', async () => {
+test('a deliver() failure is silent to the user, queued for retry, and does not crash the loop', async () => {
   const w = world({ reply: 'owed text' });
   w.no = w.make({
     deliver: async () => {
@@ -202,7 +202,8 @@ test('a deliver() failure is silent and does not crash the loop', async () => {
   await w.no.start();
   w.no.noteReply(C, 'x');
   await w.advance(DELAY);
-  assert.ok(w.types().includes('failed'));
+  assert.ok(w.types().includes('delivery_retry'));
+  assert.equal(w.no.outbox().length, 1);
   w.no.noteReply(C, 'y');
   await w.advance(DELAY);
   assert.equal(w.turns.length, 2);
@@ -215,7 +216,7 @@ test('pending checks persist in a file and reload after a restart', async () => 
   await w.no.start();
   w.no.noteReply(C, 'before restart');
   await new Promise((r) => setImmediate(r));
-  assert.equal(JSON.parse(readFileSync(path, 'utf8'))[0].replies[0].text, 'before restart');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).records[0].replies[0].text, 'before restart');
   w.no.stop();
 
   w.timers = [];
@@ -236,7 +237,7 @@ test('a check that was running when the process stopped runs again after a resta
   w.t += DELAY;
   void w.no.tick();
   await new Promise((r) => setImmediate(r));
-  assert.equal(store.load()[0].state, 'running');
+  assert.equal(store.load().records[0].state, 'running');
 
   const again = createNothingOwed({ store, runTurn: async () => 'NOTHING_OWED', deliver: async () => {}, now: () => w.t, setTimer: () => 0, clearTimer: () => {} });
   await again.start();
