@@ -12,8 +12,7 @@ test('parser: every near-miss NOTHING_OWED form is nothing, never sent', () => {
     'NOTHING OWED',
     'nothing-owed',
     'I checked the list.\nNOTHING_OWED',
-    'NOTHING_OWED\nSTILL_RUNNING',
-    'NOTHING_OWED except the summary: it was delivered.',
+    'NOTHING_OWED: the summary was delivered.',
     '> **NOTHING_OWED**',
     '"Nothing_Owed!"',
   ]) {
@@ -21,10 +20,11 @@ test('parser: every near-miss NOTHING_OWED form is nothing, never sent', () => {
   }
 });
 
-test('parser: a NOTHING_OWED first or last line wins even in a long reply', () => {
+test('parser: a last-line NOTHING_OWED wins in a long reply; content after a first-line one is delivered', () => {
   const long = 'I looked at everything. '.repeat(20);
   assert.equal(parseOutcome(`${long}\nNOTHING_OWED`), 'nothing');
-  assert.equal(parseOutcome(`**nothing_owed**\n${long}`), 'nothing');
+  assert.deepEqual(parseCheckReply(`**nothing_owed**\n${long}`), { outcome: 'deliver', text: long.trim() });
+  assert.equal(parseOutcome('NOTHING_OWED\nSTILL_RUNNING'), 'running', 'contradicting markers keep the check open');
 });
 
 test('parser: STILL_RUNNING as the first line, with or without a note, is running or deliver_running', () => {
@@ -41,7 +41,7 @@ test('parser: DUE <ISO time> alone, or as the last line after content', () => {
   assert.deepEqual(parseCheckReply(`DUE ${iso}`), { outcome: 'due', text: '', dueAt: Date.parse(iso) });
   assert.deepEqual(parseCheckReply(`\`DUE 2026-01-11T09:00:00Z\``), { outcome: 'due', text: '', dueAt: Date.parse(iso) });
   assert.deepEqual(parseCheckReply(`Noted, I will remind you tomorrow at 9.\nDUE: ${iso}`), { outcome: 'due', text: 'Noted, I will remind you tomorrow at 9.', dueAt: Date.parse(iso) });
-  assert.equal(parseOutcome(`due ${iso}`), 'due');
+  assert.equal(parseOutcome(`due ${iso}`), 'deliver', 'only upper-case DUE is a marker');
 });
 
 test('parser: a DUE line with a time that does not parse is running, never sent', () => {

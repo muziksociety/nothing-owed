@@ -14,9 +14,10 @@ test('parseOutcome: STILL_RUNNING variants', () => {
   }
 });
 
-test('parseOutcome: a short reply that mentions NOTHING_OWED is nothing; other text is delivered', () => {
-  assert.equal(parseOutcome('Nothing owed, but here is a note'), 'nothing');
-  assert.equal(parseOutcome('NOTHING_OWED except the summary: ...'), 'nothing');
+test('parseOutcome: a short nothing-owed sentence is nothing; marker plus real content is delivered', () => {
+  assert.equal(parseOutcome('Nothing owed.'), 'nothing');
+  assert.equal(parseOutcome('Nothing owed, but here is a note'), 'deliver');
+  assert.equal(parseOutcome('NOTHING_OWED except the summary: ...'), 'deliver');
   assert.equal(parseOutcome('Here is the summary.'), 'deliver');
 });
 

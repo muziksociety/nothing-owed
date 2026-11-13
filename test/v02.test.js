@@ -134,7 +134,8 @@ test('parseOutcome: a reply ending in a STILL_RUNNING line is deliver_running', 
     assert.equal(parseOutcome(s), 'deliver_running', JSON.stringify(s));
   }
   assert.equal(parseOutcome('STILL_RUNNING'), 'running');
-  assert.equal(parseOutcome('STILL_RUNNING is what I would say, but here is A.'), 'deliver');
+  // a STILL_RUNNING token inside a sentence is never sent raw: it reads "still running" and the check stays open
+  assert.deepEqual(parseCheckReply('STILL_RUNNING is what I would say, but here is A.'), { outcome: 'deliver_running', text: 'Still running is what I would say, but here is A.' });
 });
 
 test('parseCheckReply returns the outcome and the text minus the marker line', () => {

@@ -37,6 +37,9 @@ const list = (items, max, messageCount) =>
  * @param {{at:number,text:string,seq?:number}[]} input.replies the agent's replies in this check
  * @param {{at:number,text:string}[]} [input.delivered] what the host actually delivered in that window
  * @param {{at:number,text:string}[]} [input.queued] deliveries waiting for a retry (sent automatically)
+ * @param {{at:number,text:string}[]} [input.failed] deliveries given up on (the agent may write them again)
+ * @param {number}  [input.deliveredSince] set when the send log does not reach back to the window start:
+ *   the oldest time it covers
  * @param {boolean} [input.isLastCheck]  true on the final check (one-line status)
  * @param {string}  [input.userLabel]    how the prompt names the user (default "the user")
  * @param {number}  [input.maxTextLength] bound each listed text to this many characters (default 300)
@@ -51,6 +54,8 @@ export function buildPrompt({
   replies,
   delivered = [],
   queued = [],
+  failed = [],
+  deliveredSince,
   isLastCheck = false,
   userLabel = 'the user',
   maxTextLength = 300,
@@ -76,8 +81,14 @@ export function buildPrompt({
   lines.push(`Messages the host actually delivered to ${u} in this conversation since just before the first of those replies (from the host's send log):`);
   if (hidden) lines.push(`(${hidden} older not shown)`);
   lines.push(cap === 0 && hidden ? '' : list(shown, maxTextLength, 0));
+  if (deliveredSince != null) {
+    lines.push(`This delivered list may be incomplete: the send log only reaches back to ${iso(deliveredSince)}. Do not send anything again unless you are sure ${u} never got it.`);
+  }
   if (queued.length) {
     lines.push('Queued, will be sent automatically - do not write these again:', list(queued, maxTextLength, 0));
+  }
+  if (failed.length) {
+    lines.push('Failed to send - write it again if still needed:', list(failed, maxTextLength, 0));
   }
   lines.push(
     `Only what is in this delivered list reached ${u}. Anything you wrote that is not in it, they never saw.`,
@@ -131,22 +142,27 @@ const decor = (line) =>
     .replace(/^[`*_"'“”‘’\s]+/, '')
     .replace(/[`*_"'“”‘’.!?,;:\s]+$/, '');
 
-const markerRe = (word) => new RegExp(`^${word}\\s*(?:\\(.*\\)|\\[.*\\]|[-–—:].*)?$`, 'i');
+// A marker line: the marker alone, an optional label before it ("Status:"), an optional short note
+// after it ("(render)", "- all delivered").
+const markerRe = (word) => new RegExp(`^(?:(?:status|answer|result|outcome)\\s*:\\s*)?${word}\\s*(?:\\(.*\\)|\\[.*\\]|[-–—:].*)?$`, 'i');
 const NOTHING_LINE = markerRe('nothing[\\s_-]*owed');
 const RUNNING_LINE = markerRe('still[\\s_-]*running');
-const NOTHING_ANY = /nothing[\s_-]*owed/i;
-const SHORT = 200;
+const NOTHING_TOKEN = /nothing_owed/i;
+const NOTHING_PHRASE = /\b(?:nothing[\s_-]+(?:is\s+)?owed|i\s+owe\s+nothing)\b/i;
+const LEADING_NOTHING = /^nothing[_ ]owed\b[\s,:;.]*(?:except(?:\s+for)?|but|apart\s+from|other\s+than|besides|however)\b[\s,:;]*/i;
+const RUNNING_TOKEN = /\bSTILL_RUNNING\b/gi;
+const HAS_RUNNING_TOKEN = /\bSTILL_RUNNING\b/i;
+const ISO_ZONED = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
 
-// A DUE line: { at } for a valid time, { invalid: true } for an upper-case DUE line whose time does
-// not parse, null for a line that is not a DUE line ("Due to the outage..." stays content).
+// A DUE line (upper-case DUE only, so "Due 12 May..." stays content). { at } for an ISO time with a
+// zone, optionally in <...> and followed by a short note; { invalid: true } for any other DUE line.
 function dueLine(line) {
   const d = decor(line);
-  const m = d.match(/^due\b[\s:]*(.*)$/i);
+  const m = d.match(/^DUE\b[\s:]*(.*)$/);
   if (!m) return null;
-  const rest = m[1].replace(/[`*"']/g, '').trim();
-  const at = /^\d/.test(rest) ? Date.parse(rest) : NaN;
-  if (Number.isFinite(at)) return { at };
-  return /^DUE\b/.test(d) ? { invalid: true } : null;
+  const t = m[1].match(/^<?\s*([^\s<>]+)\s*>?\s*(.*)$/);
+  if (t && ISO_ZONED.test(t[1]) && (!t[2] || /^[-–—:(,;[]/.test(t[2]))) return { at: Date.parse(t[1]) };
+  return { invalid: true };
 }
 
 function trimBlank(lines) {
@@ -157,14 +173,26 @@ function trimBlank(lines) {
   return lines.slice(a, b);
 }
 
+const lastSentence = (s) => s.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean).pop() || '';
+const capitalize = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+const isNote = (body) => /^\(.*\)$/s.test(body.trim());
+
 /**
- * Classify the check turn's reply and return the text to deliver.
+ * Classify the check turn's reply and return the text to deliver. Strict about what it sends,
+ * loose about how markers look.
  *
+ * - `<think>` blocks and code-fence lines are removed first
  * - empty, `...`, or a `failTexts` entry: failed
- * - a NOTHING_OWED first or last line (any case, decorated, with a short note), or a reply under
- *   200 characters that contains NOTHING_OWED anywhere: nothing (never sent)
- * - a `DUE <ISO time>` line alone or last (or first): due, with the rest as the text to deliver now
- * - a STILL_RUNNING first or last line: running, or deliver_running with the rest
+ * - a `DUE <ISO time with zone>` line (upper-case DUE; the time may sit in <...> and a short note may
+ *   follow) as the last or first line: due, the rest is delivered now. Any other DUE line: running
+ * - NOTHING_OWED and STILL_RUNNING marker lines (first or last line, any case, decorated, an optional
+ *   "Status:" label and a short note) are removed: both present is running; STILL_RUNNING is running
+ *   or deliver_running; a last-line NOTHING_OWED is nothing (what came before was reasoning); a
+ *   first-line NOTHING_OWED with content after it delivers that content
+ * - a reply whose last sentence holds the NOTHING_OWED token, or is a short "nothing is owed"
+ *   phrase with no numbers in it, is nothing
+ * - a reply that starts "NOTHING_OWED except ..." delivers what follows
+ * - a STILL_RUNNING token inside a sentence becomes "still running" and the reply is deliver_running
  * - anything else: deliver
  *
  * @param {string} text
@@ -172,31 +200,51 @@ function trimBlank(lines) {
  * @returns {{outcome: 'nothing'|'running'|'deliver'|'deliver_running'|'due'|'failed', text: string, dueAt?: number}}
  */
 export function parseCheckReply(text, { failTexts = [] } = {}) {
-  const s = String(text ?? '').trim();
-  if (!s || s === '...' || s === '…' || failTexts.includes(s)) return { outcome: 'failed', text: '' };
-  let lines = trimBlank(s.split(/\r?\n/));
-  if (NOTHING_LINE.test(decor(lines[0])) || NOTHING_LINE.test(decor(lines[lines.length - 1]))) return { outcome: 'nothing', text: '' };
-  if (s.length < SHORT && NOTHING_ANY.test(s)) return { outcome: 'nothing', text: '' };
+  const raw = String(text ?? '').trim();
+  if (!raw || raw === '...' || raw === '…' || failTexts.includes(raw)) return { outcome: 'failed', text: '' };
+  const s = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').split(/\r?\n/).filter((l) => !/^\s*```/.test(l)).join('\n').trim();
+  if (!s) return { outcome: 'failed', text: '' };
+  let lines = trimBlank(s.split('\n'));
 
   let dueAt = null;
   let running = false;
-  const last = dueLine(lines[lines.length - 1]);
-  const first = !last && lines.length > 1 ? dueLine(lines[0]) : null;
-  if (last) lines = lines.slice(0, -1);
-  else if (first) lines = lines.slice(1);
-  const due = last || first;
+  const lastDue = dueLine(lines[lines.length - 1]);
+  const firstDue = !lastDue && lines.length > 1 ? dueLine(lines[0]) : null;
+  if (lastDue) lines = lines.slice(0, -1);
+  else if (firstDue) lines = lines.slice(1);
+  const due = lastDue || firstDue;
   if (due?.at != null) dueAt = due.at;
   else if (due?.invalid) running = true;
-
   lines = trimBlank(lines);
-  if (lines.length && RUNNING_LINE.test(decor(lines[lines.length - 1]))) {
-    lines = trimBlank(lines.slice(0, -1));
-    running = true;
-  } else if (lines.length && RUNNING_LINE.test(decor(lines[0]))) {
-    lines = trimBlank(lines.slice(1));
+
+  const first = lines.length ? decor(lines[0]) : '';
+  const last = lines.length ? decor(lines[lines.length - 1]) : '';
+  const nothingFirst = lines.length > 0 && NOTHING_LINE.test(first);
+  const nothingLast = lines.length > 0 && NOTHING_LINE.test(last);
+  const runningFirst = lines.length > 0 && RUNNING_LINE.test(first);
+  const runningLast = lines.length > 0 && RUNNING_LINE.test(last);
+
+  if ((nothingFirst || nothingLast) && (runningFirst || runningLast)) return { outcome: 'running', text: '' };
+  if (nothingLast && dueAt == null && !running) return { outcome: 'nothing', text: '' };
+  if (nothingFirst) lines = trimBlank(lines.slice(1));
+  else if (nothingLast) lines = trimBlank(lines.slice(0, -1));
+  if (runningLast) { lines = trimBlank(lines.slice(0, -1)); running = true; }
+  else if (runningFirst) { lines = trimBlank(lines.slice(1)); running = true; }
+
+  let body = lines.join('\n').trim();
+  const leading = LEADING_NOTHING.test(body);
+  if (body && !leading && !nothingFirst && dueAt == null && !running) {
+    const end = lastSentence(body);
+    if (NOTHING_TOKEN.test(end)) return { outcome: 'nothing', text: '' };
+    if (end.length <= 60 && NOTHING_PHRASE.test(end) && !/\d/.test(end)) return { outcome: 'nothing', text: '' };
+  }
+  if (leading) body = capitalize(body.replace(LEADING_NOTHING, '').trim());
+  if (HAS_RUNNING_TOKEN.test(body)) {
+    body = capitalize(body.replace(RUNNING_TOKEN, 'still running'));
     running = true;
   }
-  const body = lines.join('\n').trim();
+  if ((dueAt != null || running) && isNote(body)) body = '';
+
   if (dueAt != null) return { outcome: 'due', text: body, dueAt };
   if (running) return body ? { outcome: 'deliver_running', text: body } : { outcome: 'running', text: '' };
   return body ? { outcome: 'deliver', text: body } : { outcome: 'nothing', text: '' };
