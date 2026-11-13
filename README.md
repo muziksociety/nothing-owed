@@ -154,6 +154,30 @@ What the package sends through `deliver()` it counts and logs as delivered itsel
 
 **Keep the process alive.** The scheduler's timers are unref'd: they never keep Node running on their own. In a bot or server, the polling loop or the open port does that; in a script, keep something alive (or the checks never fire).
 
+### Wiring
+
+Three lessons from putting the package into a real Telegram bot that sends rendered media to its users:
+
+- **Run your reply guards inside `deliver()`.** If your host filters or guards its own replies (for example, it blocks false "it's on its way" promises), the package's messages must pass the same guards: they reach the user through `deliver()`, not through your normal reply path. Return `{ text }` when a guard rewrote the text, and `{ skipped: true }` when it blocked it.
+- **Package messages are not normal replies.** Everything sent through `deliver()` carries `meta.kind` (`check`, `report`, `giveup`, `fallback` or `missed`). Do not treat these as a normal agent reply that can start actions. For example, if a check message ends with "shall I do it?" and the user answers "yes", that "yes" must not trigger work on its own: route it through a normal user turn, where the agent sees its history and decides.
+- **Tell the package when you already told the user.** If your own error handler sends a failure message for a job, pass `userNotified: true`, or the report turn sends a second one:
+
+  ```js
+  try {
+    await renderVideo(jobId);
+    await owed.finishJob(jobId, { status: 'done', text: 'rendered' });
+  } catch (err) {
+    await chat.send(id, 'Sorry, the render failed. Try again later.');
+    await owed.finishJob(jobId, { status: 'error', text: err.message, userNotified: true });
+  }
+
+  // with wrapJob: your catch tells the user, so a rejection runs no report turn
+  await owed.wrapJob(id, jobId, renderVideo(), { title: 'render', userNotifiedOnError: true })
+    .catch(() => chat.send(id, 'Sorry, the render failed. Try again later.'));
+  ```
+
+  If you only learn later that the user was told, call `noteJobUserNotified(jobId)`: a report still waiting is skipped, and one already being written is dropped before `deliver()` (event `report_dropped`).
+
 Try it without an API key (a fake model on a virtual clock; every run prints exactly this):
 
 ```sh
@@ -238,6 +262,7 @@ const output = await owed.wrapJob(conversationId, jobId, renderVideo(), { title:
 - A check that answers `STILL_RUNNING` while the conversation has an open tracked job comes back once more, then **parks** on it. No model wakes while parked. A *failed* check never parks: it takes the ladder, so an unrelated open job cannot delay a promise.
 - `finishJob` and `wrapJob` resolve at once. In the background, the package queues **one report turn** in the same session (job title, status, its output, the messages delivered since the job ended, "tell the user what it produced and what is still open"). If you already sent the result yourself and noted it with `noteReply`, the report turn sees it, answers `NOTHING_OWED`, and nothing more is sent. The report is stored, waits while the user is mid-turn, and a failed report turn is retried on the same ladder as a check. It is marked delivered in the store right before it is sent, so a crash after the send never sends it twice. Events tell you when it is done: `report_delivered`, `report_fallback`, `report_done`.
 - If the report turn keeps failing, answers `NOTHING_OWED` (with no reply of yours since the job ended) or only `STILL_RUNNING`, or the circuit breaker says the model is down, the user gets a **code-written report**: `<title> <status>: <first line, up to 300 characters>`. For an object result that line is its `text` or `summary`, never raw JSON; without either it is just `<title> <status>.`
+- If your host already told the user how the job ended (its own failure message, say), pass `finishJob(jobId, { ..., userNotified: true })` or `wrapJob(..., { userNotifiedOnError: true })`: no report turn runs, a `report_skipped` event fires with reason `user_notified`, and parked checks still unpark. See Wiring.
 - Pass `onJobFinished(conversationId, job)` to deliver the result yourself instead. Note what you send with `noteReply(id, text, { kind: 'report' })` so it gets its verify check.
 - Then the parked check runs once, in case something else was owed. A check parked on two jobs waits for both.
 - **Safety net:** a check parked longer than `jobTimeoutMs` (2 hours) runs once with the last-check prompt, so the user gets a one-line status that says plainly it is no longer watched, parks one more period, then ends.
@@ -272,6 +297,8 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 | `onJobFinished(id, job)` | report turn | Deliver a finished job's result yourself instead of the report turn. |
 | `onStartJobs(jobs)` | keep none | Jobs found in the store at `start()`: return the ids your host still runs; the rest finish as `lost`. |
 | `giveUpText(ctx)` | built-in lines | The code-written lines; `ctx.reason` is `failed`, `still_running`, `verify_capped`, `daily_cap` (with `until`) or `due_limit`. |
+| `strings` | English (`defaultStrings`) | Replace any user-visible string: `missedPrefix`, `fallbackReport` / `fallbackReportNoLine` templates (`{title}`, `{status}`, `{line}`), `status` words, `lostText`, and the `giveUp` lines (`daily_cap` fills `{time}`). A partial set keeps the other defaults; `giveUpText` still wins for the give-up lines. |
+| `promptLanguage` | none | For example `'Spanish'`: the check and report prompts add "Write anything for the user in Spanish." The rest of the prompt stays English. |
 | `dailyCap` | `60` | Model turns per conversation per UTC day (`0` disables). |
 | `onEvent(event)`, `onUsage(info)` | none | Every event (see `index.d.ts`), and turn usage or cost. |
 
@@ -306,11 +333,11 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 
 </details>
 
-Methods: `noteReply(id, text, { kind? })`, `noteUserMessage(id)`, `messageCount(id)`, `noteDelivered(id, text, at | { at, id })`, `flushMissed(id)`, `isChecking(id)`, `trackJob(id, jobId, { title })`, `finishJob(jobId, { status, text, summary })`, `wrapJob(id, jobId, promiseOrFn, { title })`, `start()`, `stop()`, `flush()`, `tick()`, `idle()`, `pending()`, `parked()`, `dated()`, `jobs()`, `reports()`, `outbox()`, `missed()`, `circuit()`.
+Methods: `noteReply(id, text, { kind? })`, `noteUserMessage(id)`, `messageCount(id)`, `noteDelivered(id, text, at | { at, id })`, `flushMissed(id)`, `isChecking(id)`, `trackJob(id, jobId, { title })`, `finishJob(jobId, { status, text, summary, userNotified })`, `wrapJob(id, jobId, promiseOrFn, { title, userNotifiedOnError })`, `noteJobUserNotified(jobId)`, `start()`, `stop()`, `flush()`, `tick()`, `idle()`, `pending()`, `parked()`, `dated()`, `jobs()`, `reports()`, `outbox()`, `missed()`, `circuit()`.
 
 `noteReply` kinds: none or `reply` opens or joins a window; `check` and `report` (replies you delivered yourself) count and get one verify check; `giveup`, `fallback` and `missed` only count; `system` does neither.
 
-Also exported: `buildPrompt()`, `buildReportPrompt()`, `parseOutcome()`, `parseCheckReply()`, `stripStillRunning()`, `clipText()`, `isJunkReply()`, `defaultGiveUpText()`, `fallbackReportText()`, `createFileStore()`, `createMemoryStore()`, `createDeliveredLog()`, `NOTHING_OWED`, `STILL_RUNNING`. Types are in [`index.d.ts`](./index.d.ts).
+Also exported: `buildPrompt()`, `buildReportPrompt()`, `parseOutcome()`, `parseCheckReply()`, `stripStillRunning()`, `clipText()`, `isJunkReply()`, `defaultGiveUpText(ctx, strings?)`, `fallbackReportText(job, strings?)`, `defaultStrings`, `createFileStore()`, `createMemoryStore()`, `createDeliveredLog()`, `NOTHING_OWED`, `STILL_RUNNING`. Types are in [`index.d.ts`](./index.d.ts).
 
 ## Adapters
 

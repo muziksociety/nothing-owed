@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-11-13
+
+Lessons from putting the package into a Telegram bot that sends rendered media to its users.
+With no new options set, every output is the same as in 0.4.3.
+
+### Added
+
+- `finishJob(jobId, { ..., userNotified: true })`: the host already told the user how the job
+  ended (for example with its own failure message). No report turn runs and `onJobFinished` is not
+  called; a `report_skipped` event fires with reason `user_notified`; checks parked on the job
+  still unpark. Before, the user got two failure messages.
+- `wrapJob(..., { userNotifiedOnError })`: `true`, or a function of the error, when your error path
+  tells the user itself; a rejection then runs no report turn.
+- `noteJobUserNotified(jobId)`: the same flag set later. On an open job, its `finishJob` runs no
+  report turn; a report still waiting is skipped; a report turn already running, or a report
+  waiting for a delivery retry, is dropped right before `deliver()` (new event `report_dropped`,
+  reason `user_notified`). The flag is stored, so it survives a restart.
+- `strings` option and the exported `defaultStrings`: every user-visible string the package writes
+  can be replaced: the `Missed: ` prefix, the code-written report's template and status words, the
+  "interrupted by a restart" text, and the give-up lines. `defaultGiveUpText` and
+  `fallbackReportText` take a strings set as a second argument.
+- `promptLanguage` option (for example `'Spanish'`): the check and report prompts add one line,
+  "Write anything for the user in Spanish." `buildPrompt` and `buildReportPrompt` take `language`.
+
+### Docs
+
+- README Wiring notes: run your reply guards inside `deliver()`; package messages carry
+  `meta.kind` and must not be treated as normal replies that can start actions; a `userNotified`
+  example.
+
 ## [0.4.3] - 2026-11-13
 
 ### Added
