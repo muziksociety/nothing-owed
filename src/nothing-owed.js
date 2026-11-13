@@ -538,12 +538,17 @@ export function createNothingOwed(options = {}) {
     return p;
   };
 
-  const sendWithMissed = async (cid, text, meta) => {
+  // `drop()`: asked right before deliver(); true means the text must not go out any more.
+  const sendWithMissed = async (cid, text, meta, drop) => {
     if (missed[cid]?.length) await sendMissed(cid, true);
+    if (drop?.()) return { dropped: true };
     return sendOnce(cid, text, meta);
   };
 
   const outboxIds = (item) => ({ conversationId: item.conversationId, kind: item.kind, checkId: item.checkId, jobId: item.jobId });
+  // A job report (or its code-written fallback) not sent because the host told the user itself.
+  const emitDropped = ({ conversationId, jobId, kind }) =>
+    emit({ type: 'report_dropped', conversationId, jobId, kind, reason: 'user_notified' });
 
   // A delivery attempt failed: queue a retry or give up (the text becomes a missed notice).
   const failDelivery = (item, error) => {
@@ -563,12 +568,14 @@ export function createNothingOwed(options = {}) {
 
   // First attempt for a text the package produced. Resolves { ok, ids }. A failure is kept for
   // retry; it never reaches runTurn again. A deliver() that hangs times out into the outbox.
-  const deliverOwed = async (cid, text, meta) => {
+  const deliverOwed = async (cid, text, meta, drop) => {
     try {
-      const { ids, text: sentText, skipped } = await sendWithMissed(cid, text, meta);
+      const { ids, text: sentText, skipped, dropped } = await sendWithMissed(cid, text, meta, drop);
+      if (dropped) return { ok: false, dropped: true };
       return { ok: true, ids, text: sentText, skipped: !!skipped };
     } catch (error) {
       const item = { id: newId('out', now()), conversationId: cid, text, attempts: 1, due: 0, at: now(), ...meta };
+      if (drop?.()) return { ok: false, dropped: true };
       failDelivery(item, error);
       return { ok: false };
     }
@@ -578,10 +585,11 @@ export function createNothingOwed(options = {}) {
     item.sending = true;
     item.attempts += 1;
     try {
-      const { ids, text: sentText, skipped } = await sendWithMissed(item.conversationId, item.text, item);
+      const { ids, text: sentText, skipped, dropped } = await sendWithMissed(item.conversationId, item.text, item, () => !!item.userNotified);
       outbox = outbox.filter((o) => o !== item);
-      emit({ type: 'delivery_recovered', ...outboxIds(item), attempt: item.attempts, ids });
-      if (!skipped && VERIFY_KINDS.has(item.kind)) scheduleVerify(item.conversationId, sentText, (item.depth || 0) + 1, undefined, item.dueDepth);
+      if (dropped) emitDropped(item);
+      else emit({ type: 'delivery_recovered', ...outboxIds(item), attempt: item.attempts, ids });
+      if (!dropped && !skipped && VERIFY_KINDS.has(item.kind)) scheduleVerify(item.conversationId, sentText, (item.depth || 0) + 1, undefined, item.dueDepth);
     } catch (error) {
       failDelivery(item, error);
     } finally {
@@ -921,15 +929,22 @@ export function createNothingOwed(options = {}) {
   // ---- jobs and report turns --------------------------------------------------------------
 
   // Mark the report delivered in the store before the send: a crash after the send never repeats it.
+  // A text the host already covered (noteJobUserNotified) is dropped right before deliver().
   async function sendReport(rep, text, kind) {
-    rep.delivering = true;
-    await flushAll();
-    return deliverOwed(rep.conversationId, text, { kind, jobId: rep.job.id, depth: 0 });
+    const drop = () => !!rep.userNotified;
+    let sent = { ok: false, dropped: true };
+    if (!drop()) {
+      rep.delivering = true;
+      await flushAll();
+      sent = await deliverOwed(rep.conversationId, text, { kind, jobId: rep.job.id, depth: 0 }, drop);
+    }
+    if (sent.dropped) emitDropped({ conversationId: rep.conversationId, jobId: rep.job.id, kind });
+    return sent;
   }
 
   async function reportFallback(rep, reason) {
     const sent = await sendReport(rep, fallbackReportText(rep.job, S), 'fallback');
-    emit({ type: 'report_fallback', conversationId: rep.conversationId, jobId: rep.job.id, reason, delivered: sent.ok });
+    if (!sent.dropped) emit({ type: 'report_fallback', conversationId: rep.conversationId, jobId: rep.job.id, reason, delivered: sent.ok });
   }
 
   async function reportDone(rep) {
@@ -960,6 +975,12 @@ export function createNothingOwed(options = {}) {
         return 'busy';
       }
       held = true;
+      if (rep.userNotified) {
+        // the host told the user while this report waited (or before a restart)
+        free();
+        emit({ type: 'report_skipped', conversationId: cid, jobId: job.id, reason: 'user_notified' });
+        return await reportDone(rep);
+      }
       if (spendTurn(cid, 'report')) {
         free();
         emit({ type: 'daily_cap', conversationId: cid, checkId: null, jobId: job.id, until: nextDay() });
@@ -1129,15 +1150,23 @@ export function createNothingOwed(options = {}) {
      * code-written line), then any check parked on it. Events say when: report_delivered,
      * report_fallback, report_done.
      */
-    finishJob(jobId, { status = 'done', text = '', summary } = {}) {
+    finishJob(jobId, { status = 'done', text = '', summary, userNotified = false } = {}) {
       const id = String(jobId);
       const open = jobs[id];
       if (!open) return Promise.resolve(null);
       delete jobs[id];
-      const job = { ...open, status, text: String(text ?? ''), ...(summary != null ? { summary: String(summary) } : {}), finishedAt: now() };
+      const { userNotified: notedBefore, ...rest } = open;
+      const job = { ...rest, status, text: String(text ?? ''), ...(summary != null ? { summary: String(summary) } : {}), finishedAt: now() };
       const cid = job.conversationId;
       emit({ type: 'job_finished', conversationId: cid, jobId: id, status });
-      if (typeof onJobFinished === 'function') {
+      if (userNotified || notedBefore) {
+        // the host already told the user how it ended: no report turn, no onJobFinished
+        emit({ type: 'report_skipped', conversationId: cid, jobId: id, reason: 'user_notified' });
+        unparkFor(job);
+        void save();
+        arm();
+        void track(api.tick());
+      } else if (typeof onJobFinished === 'function') {
         void track((async () => {
           try { await timed('onJobFinished', () => onJobFinished(cid, { ...job })); } catch (error) { emit({ type: 'error', stage: 'onJobFinished', conversationId: cid, jobId: id, error }); }
           unparkFor(job);
@@ -1153,14 +1182,51 @@ export function createNothingOwed(options = {}) {
       return Promise.resolve({ ...job });
     },
 
+    /**
+     * The host told the user itself how a job ended (or will, for an open job). An open job's
+     * finishJob then runs no report turn; a report still waiting is skipped; a report turn already
+     * running, or a report waiting for a delivery retry, is dropped before deliver(). Returns
+     * false when nothing about that job is still open.
+     */
+    noteJobUserNotified(jobId) {
+      const id = String(jobId);
+      if (jobs[id]) {
+        jobs[id].userNotified = true;
+        void save();
+        return true;
+      }
+      let found = false;
+      const rep = reports.find((p) => p.job.id === id);
+      if (rep) {
+        found = true;
+        rep.userNotified = true;
+        if (rep.state !== 'running') {
+          rep.state = 'running';
+          emit({ type: 'report_skipped', conversationId: rep.conversationId, jobId: id, reason: 'user_notified' });
+          void track(reportDone(rep));
+        }
+      }
+      for (const o of outbox.filter((x) => x.jobId === id && (x.kind === 'report' || x.kind === 'fallback'))) {
+        found = true;
+        if (o.sending) { o.userNotified = true; continue; } // dropped before its deliver()
+        outbox = outbox.filter((x) => x !== o);
+        emitDropped(o);
+      }
+      if (found) { void save(); arm(); }
+      return found;
+    },
+
     /** trackJob, await the work, finishJob with its result (or error message), return the result. */
-    async wrapJob(conversationId, jobId, work, { title } = {}) {
+    async wrapJob(conversationId, jobId, work, { title, userNotifiedOnError = false } = {}) {
       api.trackJob(conversationId, jobId, { title });
       let result;
       try {
         result = await (typeof work === 'function' ? work() : work);
       } catch (error) {
-        await api.finishJob(jobId, { status: 'error', text: error?.message ?? String(error) });
+        // userNotifiedOnError: the host's own error path tells the user (true, or per error)
+        let userNotified = false;
+        try { userNotified = typeof userNotifiedOnError === 'function' ? !!userNotifiedOnError(error) : !!userNotifiedOnError; } catch { userNotified = false; }
+        await api.finishJob(jobId, { status: 'error', text: error?.message ?? String(error), userNotified });
         throw error;
       }
       let text = '';

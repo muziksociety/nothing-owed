@@ -67,6 +67,8 @@ export interface TrackedJob {
   conversationId: string;
   title: string;
   startedAt: number;
+  /** Set by noteJobUserNotified: its finishJob runs no report turn. */
+  userNotified?: boolean;
 }
 
 export interface FinishedJob extends TrackedJob {
@@ -90,6 +92,8 @@ export interface ReportRecord {
   state: 'pending' | 'running';
   /** Set (and saved) right before the report is sent: after a restart it is never sent again. */
   delivering?: boolean;
+  /** Set by noteJobUserNotified: the report text is dropped before deliver(). */
+  userNotified?: boolean;
 }
 
 /** What a package delivery is. Passed to deliver() so the host can forward it to noteReply. */
@@ -232,7 +236,9 @@ export type NothingOwedEvent =
   | { type: 'due_limit'; at: number; conversationId: string; checkId: string | null; dueDepth: number; dated: number }
   | { type: 'missed_retry'; at: number; conversationId: string; retryInMs: number; error: unknown }
   | { type: 'report_done'; at: number; conversationId: string; jobId: string }
-  | { type: 'report_skipped'; at: number; conversationId: string; jobId: string; reason: 'host_replied' }
+  | { type: 'report_skipped'; at: number; conversationId: string; jobId: string; reason: 'host_replied' | 'user_notified' }
+  /** A report (or its code-written fallback) already written was not sent: the host told the user itself. */
+  | { type: 'report_dropped'; at: number; conversationId: string; jobId: string; kind: 'report' | 'fallback'; reason: 'user_notified' }
   | { type: 'turn_timeout'; at: number; conversationId: string; kind: 'check' | 'report'; checkId?: string | null; jobId?: string | null }
   | { type: 'nothing_owed'; at: number; conversationId: string; checkId: string; ms: number }
   | { type: 'still_running'; at: number; conversationId: string; checkId: string; recheck: number; ms: number }
@@ -493,9 +499,17 @@ export interface NothingOwed {
   isChecking(conversationId: string): boolean;
   trackJob(conversationId: string, jobId: string, opts?: { title?: string }): TrackedJob;
   /** Resolves at once with the finished job (null for an unknown job). The report runs in the background: watch report_delivered, report_fallback, report_done. */
-  finishJob(jobId: string, opts?: { status?: 'done' | 'error' | 'stopped' | 'lost' | string; text?: string; summary?: string }): Promise<FinishedJob | null>;
-  /** trackJob, await the work, finishJob with its result or error message, return the result (or rethrow). */
-  wrapJob<T>(conversationId: string, jobId: string, work: Promise<T> | (() => Promise<T> | T), opts?: { title?: string }): Promise<T>;
+  /** userNotified: the host already told the user how it ended: no report turn and no onJobFinished (event report_skipped, reason user_notified); parked checks still unpark. */
+  finishJob(jobId: string, opts?: { status?: 'done' | 'error' | 'stopped' | 'lost' | string; text?: string; summary?: string; userNotified?: boolean }): Promise<FinishedJob | null>;
+  /** trackJob, await the work, finishJob with its result or error message, return the result (or rethrow). userNotifiedOnError: your error path tells the user itself (true, or decided per error), so a rejection runs no report turn. */
+  wrapJob<T>(conversationId: string, jobId: string, work: Promise<T> | (() => Promise<T> | T), opts?: { title?: string; userNotifiedOnError?: boolean | ((error: unknown) => boolean) }): Promise<T>;
+  /**
+   * The host told the user itself how this job ended. Open job: its finishJob runs no report turn.
+   * Report still waiting: skipped (report_skipped). Report turn running, or report waiting for a
+   * delivery retry: its text is dropped before deliver() (report_dropped). False when nothing about
+   * the job is still open.
+   */
+  noteJobUserNotified(jobId: string): boolean;
   /** Loads the store (notes made earlier are merged), takes its lock, arms the timer. */
   start(): Promise<NothingOwed>;
   /** Stops the timer and writes the final state (sync when the store can). */
