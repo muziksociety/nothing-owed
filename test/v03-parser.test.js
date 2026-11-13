@@ -87,8 +87,11 @@ test('prompt: queued deliveries get their own do-not-repeat list', () => {
 
 test('prompt: states the time now and explains DUE', () => {
   const p = buildPrompt({ replies: [{ at: 0, text: 'x' }], now: T });
-  assert.ok(p.includes('The time now is 2026-01-10T12:00:00.000Z.'));
-  assert.match(p, /DUE <ISO 8601 time>/);
+  assert.ok(p.includes('Now (UTC): 2026-01-10T12:00:00.000Z.'));
+  const z = buildPrompt({ replies: [{ at: 0, text: 'x' }], now: T, timeZone: 'America/New_York' });
+  const line = z.split('\n').find((l) => l.startsWith('Now: '));
+  assert.ok(line.includes('07:00') && line.endsWith('(America/New_York), 2026-01-10T12:00:00.000Z.'), line);
+  assert.match(p, /DUE <time in UTC, ISO 8601 ending in Z>/);
 });
 
 test('prompt: the last check asks for a status that says plainly it is no longer watched', () => {

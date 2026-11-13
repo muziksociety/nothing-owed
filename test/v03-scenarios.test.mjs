@@ -69,14 +69,36 @@ test('case 1: the model is overloaded at the check; the promise is kept and deli
   assert.deepEqual(s.got, [{ min: 20, text: 'Summary: three points.' }]);
 });
 
-test('case 1b: the model never recovers; the user is told plainly at the end of the ladder', async () => {
-  const s = scenario({ model: () => { throw new Error('529 overloaded'); } });
+test('case 1b: the model never recovers (circuit breaker off): the user is told plainly at the end of the ladder', async () => {
+  const s = scenario({ model: () => { throw new Error('529 overloaded'); }, extra: { circuitFailures: 0 } });
   await s.build();
   s.user();
   s.agent('I will send the summary when it is done.');
   await s.to(400);
   assert.deepEqual(s.wakes.map((w) => w.min), [5, 10, 15, 20, 25, 30, 35, 50, 80, 140, 260]);
-  assert.deepEqual(s.got, [{ min: 260, text: 'I could not check on what I promised you earlier. Ask me again if it is still open.' }]);
+  assert.deepEqual(s.got, [{ min: 260, text: "I may have said I'd follow up on something, and I couldn't check it. Ask me if anything is still open." }]);
+});
+
+test('case 1c: a long outage with the circuit breaker: probes back off, nothing false is sent, the promise lands after it', async () => {
+  let down = true;
+  const s = scenario({
+    model: (prompt) => {
+      if (down) throw new Error('529 overloaded');
+      return deliveredPart(prompt).includes('Summary:') ? 'NOTHING_OWED' : 'Summary: three points.';
+    },
+  });
+  await s.build();
+  s.user();
+  s.agent('I will send the summary when it is done.');
+  await s.to(600);
+  assert.deepEqual(s.got, []);
+  assert.ok(s.events.some((e) => e.type === 'circuit_open'));
+  const during = s.wakes.length;
+  assert.ok(during <= 12, `wakes during the outage: ${during}`);
+  down = false;
+  await s.to(800);
+  assert.deepEqual(s.got.map((g) => g.text), ['Summary: three points.']);
+  assert.ok(s.events.some((e) => e.type === 'circuit_closed'));
 });
 
 test('case 2: a check reply that is itself a promise is watched; the summary arrives at the verify', async () => {
@@ -138,7 +160,7 @@ test('case 5: a send fails and waits for a retry; the recheck sees it queued; th
   assert.deepEqual(s.got, [
     { min: 10, text: 'Part A is ready: the outline.' }, // the retry; the recheck at 10 saw it queued
     // the last check (maxRechecks 2) still had only STILL_RUNNING: code says so plainly
-    { min: 15, text: 'Something I promised you earlier is still running, and I am no longer watching it. Ask me again if it is still open.' },
+    { min: 15, text: "Something I started for you may still be running, and I'm no longer watching it. Ask me if you need an update." },
   ]);
   assert.match(s.turns[1].prompt, /do not write these again:\n1\. \([^)]*\) "Part A is ready: the outline\."/);
 });
@@ -205,11 +227,11 @@ test('case 8: a restart kills a tracked job; the user is told, and nothing parks
   s.user();
   s.agent('Rendering, I will report when done.');
   s.no.trackJob(C, 'render-1', { title: 'render' });
-  await s.to(6);
+  await s.to(11); // STILL_RUNNING at 5 rechecks once, parks at 10
   assert.equal(s.no.parked().length, 1);
   await s.restart();
   await s.to(60);
-  assert.deepEqual(s.got, [{ min: 6, text: 'The render stopped: the server restarted. Ask me to start it again.' }]);
+  assert.deepEqual(s.got, [{ min: 11, text: 'The render stopped: the server restarted. Ask me to start it again.' }]);
   assert.deepEqual(s.no.jobs(), []);
   // next day: a new STILL_RUNNING has no job to park on, so it rechecks on the clock
   s.agent('Uploading the new file, I will report.');
@@ -217,7 +239,7 @@ test('case 8: a restart kills a tracked job; the user is told, and nothing parks
   assert.equal(s.no.parked().length, 0);
 });
 
-test('case 9: a delivery is given up on; the Missed line with the full text comes at the next check, not days later', async () => {
+test('case 9: a delivery is given up on; the Missed line with the full text comes on its own timer, not days later', async () => {
   let down = true;
   const s = scenario({
     failSend: () => down,
@@ -227,10 +249,10 @@ test('case 9: a delivery is given up on; the Missed line with the full text come
   await s.build();
   s.user();
   s.agent('Summary coming.');
-  await s.to(15); // 5: fail, 10: fail, 15: fail -> give-up, fresh check due at 20
+  await s.to(15); // 5: fail, 10: fail, 15: fail -> give-up, the notice's timer at 30
   down = false;
   await s.to(60);
-  assert.deepEqual(s.got, [{ min: 20, text: 'Missed: Your summary: three points, all good.' }]);
+  assert.deepEqual(s.got, [{ min: 30, text: 'Missed: Your summary: three points, all good.' }]);
 });
 
 test('case 10: "I will remind you tomorrow at 9" sets a dated timer; the reminder arrives then', async () => {
@@ -267,6 +289,7 @@ test('case 11: an outage at job end: the report turn retries, and the result rea
   await s.to(5);
   down = true;
   await s.no.finishJob('j1', { status: 'done', text: 'RESULT 42' });
+  await s.no.idle();
   await s.to(12);
   down = false;
   await s.to(60);
@@ -286,6 +309,7 @@ test('case 11b: the model stays down; the code-written fallback carries the resu
   s.no.trackJob(C, 'j1', { title: 'build' });
   await s.to(5);
   await s.no.finishJob('j1', { status: 'done', text: 'RESULT 42\nlog line 2' });
+  await s.no.idle();
   await s.to(400);
   assert.ok(s.got.some((g) => g.text === 'build done: RESULT 42'), JSON.stringify(s.got));
 });
@@ -313,6 +337,7 @@ test('case 15: a job ends while the user is mid-turn; the report waits for the t
   await s.build();
   s.no.trackJob(C, 'e1', { title: 'export' });
   await s.no.finishJob('e1', { text: '12 rows' });
+  await s.no.idle();
   await s.to(3);
   assert.deepEqual(s.wakes, [], 'no turn while the user is busy');
   busy = false;

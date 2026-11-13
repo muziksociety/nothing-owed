@@ -79,7 +79,7 @@ test('isPermanentError stops retrying at once', async () => {
   assert.equal(w.attempts.length, 1);
 });
 
-test('gives up after maxDeliveryAttempts; the fresh check sends the full Missed line once, and no copy', async () => {
+test('gives up after maxDeliveryAttempts; the missed timer sends the full Missed line once', async () => {
   const long = 'L'.repeat(200);
   const w = await setup({ reply: long, failures: (n) => n <= 3, maxDeliveryAttempts: 3 });
   w.no.noteReply(C, 'x');
@@ -89,9 +89,9 @@ test('gives up after maxDeliveryAttempts; the fresh check sends the full Missed 
   assert.equal(w.attempts.length, 3);
   assert.ok(w.types().includes('delivery_failed'));
   assert.equal(w.no.outbox().length, 0);
-  await w.advance(FIVE); // the fresh check: the Missed line first; the model's copy is a duplicate
+  await w.advance(15 * MIN); // the missed timer: 15 minutes after the give-up
   assert.deepEqual(w.sent.map((s) => s.text), [`Missed: ${long}`]);
-  assert.ok(w.types().includes('duplicate_skipped'));
+  assert.equal(w.turns.length, 1, 'no model turn spent on it');
   await w.advance(FIVE * 3);
   w.reply = 'Next item.';
   w.no.noteReply(C, 'y');
@@ -103,6 +103,7 @@ test('failed job reports are retried too', async () => {
   const w = await setup({ reply: 'Report: done.', failures: 1 });
   w.no.trackJob(C, 'j', { title: 't' });
   await w.no.finishJob('j', { status: 'done', text: 'ok' });
+  await w.no.idle();
   assert.equal(w.no.outbox().length, 1);
   assert.equal(w.no.outbox()[0].kind, 'report');
   await w.advance(FIVE);

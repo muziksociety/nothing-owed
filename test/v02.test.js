@@ -179,17 +179,19 @@ test('on the last check the marker is stripped and nothing is requeued', async (
 
 // ---- 5. job tracking ----------------------------------------------------------------------
 
-test('a running check with an open tracked job parks: no model wake until the job ends', async () => {
+test('a running check with an open tracked job rechecks once, then parks: no model wake until the job ends', async () => {
   const w = await five({ reply: 'STILL_RUNNING' });
   w.no.noteReply(C, 'Rendering now, it will report.');
   w.no.trackJob(C, 'job-1', { title: 'render' });
   await w.advance(FIVE);
-  assert.equal(w.turns.length, 1);
+  assert.equal(w.no.parked().length, 0, 'one recheck first');
+  await w.advance(FIVE);
+  assert.equal(w.turns.length, 2);
   assert.equal(w.no.pending().length, 0);
   assert.equal(w.no.parked().length, 1);
   assert.deepEqual(w.no.parked()[0].parkedOn, ['job-1']);
   await w.advance(50 * MIN);
-  assert.equal(w.turns.length, 1, 'parked: no rechecks');
+  assert.equal(w.turns.length, 2, 'parked: no rechecks');
   assert.ok(w.types().includes('parked'));
   assert.ok(w.types().includes('job_tracked'));
 });
@@ -204,15 +206,16 @@ test('finishJob runs one report turn, delivers it, then the parked check runs on
   await w.advance(10 * MIN);
   w.reply = (_c, _p, ctx) => (ctx.kind === 'report' ? 'The render is done: 3 files.' : 'NOTHING_OWED');
   await w.no.finishJob('job-1', { status: 'done', text: 'x'.repeat(5000) });
-  assert.equal(w.turns.length, 3);
-  const report = w.turns[1];
+  await w.no.idle();
+  assert.equal(w.turns.length, 4);
+  const report = w.turns[2];
   assert.equal(report.ctx.kind, 'report');
   assert.match(report.prompt, /render/);
   assert.match(report.prompt, /done/);
   assert.ok(!report.prompt.includes('x'.repeat(751)), 'job text bounded to 1500: head and tail');
   assert.ok(report.prompt.includes('x'.repeat(750) + ' … ' + 'x'.repeat(750)));
   assert.ok(report.prompt.includes('Tell the user in a few lines what it produced and what is still open. No waiting in this turn.'));
-  assert.equal(w.turns[2].ctx.kind, 'check');
+  assert.equal(w.turns[3].ctx.kind, 'check');
   assert.deepEqual(w.sent.map((s) => s.text), ['The render is done: 3 files.']);
   assert.equal(w.no.parked().length, 0);
   assert.equal(w.no.pending().length, 0);
@@ -232,6 +235,7 @@ test('a report reply routed back through noteReply is not counted twice and adds
   await w.no.start();
   w.no.trackJob(C, 'j', { title: 't' });
   await w.no.finishJob('j', { status: 'done', text: 'ok' });
+  await w.no.idle();
   assert.equal(w.sent.length, 1);
   assert.equal(w.no.pending().length, 1, 'only the package verify');
   assert.deepEqual(w.no.pending()[0].replies.map((r) => r.text), ['Report: done.']);
@@ -244,11 +248,13 @@ test('onJobFinished replaces the report turn', async () => {
   w.no.noteReply(C, 'x');
   w.no.trackJob(C, 'j', { title: 't' });
   await w.advance(FIVE);
+  await w.advance(FIVE);
   w.reply = 'NOTHING_OWED';
   await w.no.finishJob('j', { status: 'error', text: 'boom' });
+  await w.no.idle();
   assert.deepEqual(seen, [[C, 'j', 'error', 'boom']]);
-  assert.equal(w.turns.length, 2, 'parked check ran, no report turn');
-  assert.equal(w.turns[1].ctx.kind, 'check');
+  assert.equal(w.turns.length, 3, 'parked check ran, no report turn');
+  assert.equal(w.turns[2].ctx.kind, 'check');
 });
 
 test('a check parked on two jobs waits for both', async () => {
@@ -257,13 +263,16 @@ test('a check parked on two jobs waits for both', async () => {
   w.no.trackJob(C, 'a', { title: 'A' });
   w.no.trackJob(C, 'b', { title: 'B' });
   await w.advance(FIVE);
+  await w.advance(FIVE);
   await w.no.finishJob('a', { status: 'done', text: 'A ok' });
-  assert.equal(w.turns.length, 2, 'report for A only');
+  await w.no.idle();
+  assert.equal(w.turns.length, 3, 'report for A only');
   assert.equal(w.no.parked().length, 1);
   assert.deepEqual(w.no.parked()[0].parkedOn, ['b']);
   w.reply = (_c, _p, ctx) => (ctx.kind === 'report' ? 'report' : 'NOTHING_OWED');
   await w.no.finishJob('b', { status: 'done', text: 'B ok' });
-  assert.equal(w.turns.length, 4);
+  await w.no.idle();
+  assert.equal(w.turns.length, 5);
   assert.equal(w.no.parked().length, 0);
 });
 
@@ -275,6 +284,7 @@ test('wrapJob tracks, awaits, finishes with the result and returns it', async ()
   assert.deepEqual(w.no.jobs().map((j) => j.id), ['w1']);
   resolve('exported 12 rows');
   assert.equal(await p, 'exported 12 rows');
+  await w.no.idle(); // the report runs in the background
   assert.match(w.turns[0].prompt, /exported 12 rows/);
   assert.deepEqual(w.no.jobs(), []);
 });
@@ -282,6 +292,7 @@ test('wrapJob tracks, awaits, finishes with the result and returns it', async ()
 test('wrapJob reports an error and rethrows it', async () => {
   const w = await five({ reply: 'it failed' });
   await assert.rejects(w.no.wrapJob(C, 'w2', () => Promise.reject(new Error('disk full')), { title: 'export' }), /disk full/);
+  await w.no.idle();
   assert.match(w.turns[0].prompt, /error/);
   assert.match(w.turns[0].prompt, /disk full/);
 });
@@ -306,16 +317,17 @@ test('jobTimeoutMs: a parked check runs once with the last-check prompt, parks o
   w.no.noteReply(C, 'x');
   w.no.trackJob(C, 'j', { title: 'render' });
   await w.advance(FIVE);
+  await w.advance(FIVE); // parks after one recheck
   await w.advance(H2 - 1);
-  assert.equal(w.turns.length, 1);
-  await w.advance(1);
   assert.equal(w.turns.length, 2);
-  assert.equal(w.turns[1].ctx.isLastCheck, true);
-  assert.match(w.turns[1].prompt, /This is the last check/);
+  await w.advance(1);
+  assert.equal(w.turns.length, 3);
+  assert.equal(w.turns[2].ctx.isLastCheck, true);
+  assert.match(w.turns[2].prompt, /This is the last check/);
   assert.deepEqual(w.sent.map((s) => s.text), ['The render is still running and will report.']);
   assert.equal(w.no.parked().length, 1);
   await w.advance(H2);
-  assert.equal(w.turns.length, 2);
+  assert.equal(w.turns.length, 3);
   assert.equal(w.no.parked().length, 0, 'ended after one more period');
   assert.ok(w.types().includes('park_timeout'));
   assert.ok(w.types().includes('park_ended'));
@@ -333,7 +345,7 @@ test('a v0.1 store file (a plain array) still loads', async () => {
   await w.advance(FIVE);
   assert.match(w.turns[0].prompt, /1\. \(\d{4}-[^)]*Z\) "old reply"/);
   const saved = JSON.parse(readFileSync(path, 'utf8'));
-  assert.equal(saved.version, 3);
+  assert.equal(saved.version, 4);
 });
 
 test('counters, open jobs and parked checks survive a restart', async () => {
@@ -345,7 +357,8 @@ test('counters, open jobs and parked checks survive a restart', async () => {
   w.no.noteReply(C, 'x');
   w.no.trackJob(C, 'j', { title: 'render' });
   await w.advance(FIVE);
-  w.no.stop();
+  await w.advance(FIVE);
+  await w.no.stop();
   w.timers = [];
   w.no = w.make({ delayMs: FIVE, onStartJobs: (jobs) => jobs.map((j) => j.id) }); // the host still runs it
   await w.no.start();
@@ -353,10 +366,11 @@ test('counters, open jobs and parked checks survive a restart', async () => {
   assert.deepEqual(w.no.jobs().map((j) => j.id), ['j']);
   assert.equal(w.no.parked().length, 1);
   await w.advance(30 * MIN);
-  assert.equal(w.turns.length, 1, 'still parked after restart');
+  assert.equal(w.turns.length, 2, 'still parked after restart');
   w.reply = (_c, _p, ctx) => (ctx.kind === 'report' ? 'done' : 'NOTHING_OWED');
   await w.no.finishJob('j', { status: 'done', text: 'ok' });
-  assert.equal(w.turns.length, 3);
+  await w.no.idle();
+  assert.equal(w.turns.length, 4);
 });
 
 test('buildReportPrompt names the job, its status and the clipped text', () => {
@@ -425,6 +439,7 @@ test('check replies and report replies get one verify check between them; nothin
   assert.equal(w.no.pending().length, 1, 'one verify, no window from the echo');
   w.no.trackJob(C, 'j', { title: 'job' });
   await w.no.finishJob('j', { status: 'done', text: 'ok' });
+  await w.no.idle();
   assert.equal(w.sent.length, 2);
   assert.equal(w.no.pending().length, 1, 'the report joins the same verify');
   // A host that delivers them itself and marks the kind: they join it too.

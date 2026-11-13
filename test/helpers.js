@@ -21,6 +21,7 @@ export function world({ reply = 'NOTHING_OWED', store = createMemoryStore(), ...
   w.make = (extra = {}) =>
     createNothingOwed({
       delayMs: DELAY,
+      saveDebounceMs: 0, // tests read the store right after a change
       store: w.store,
       now: () => w.t,
       setTimer: (fn, ms) => {

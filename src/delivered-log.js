@@ -6,25 +6,38 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const SAME_MS = 60 * 1000;
+// File-backed logs write on a short debounce; whatever is pending is written when the process exits.
+const pendingLogs = new Set();
+let exitHooked = false;
+const flushPending = () => { for (const flush of pendingLogs) { try { flush(); } catch { /* best effort */ } } };
 const clip = (s, max) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+let tmpSeq = 0;
 
 /**
  * @param {object} [opts]
  * @param {string} [opts.path]          persist to this JSON file (default: memory only)
+ * @param {{ map?: Map<string, any[]>, path?: string, debounceMs?: number }} [opts.backing]
+ *   where a store keeps its delivered log: a shared Map (memory store) or a file (file store)
+ * @param {number} [opts.debounceMs=100] batch file writes this long (flush() writes at once; 0 writes on every note)
  * @param {number} [opts.maxPerConversation=400]
  * @param {number} [opts.maxAgeMs=172800000] drop entries, and whole idle conversations, older than this (default 2 days)
  * @param {number} [opts.maxTextLength=2000]
  * @param {() => number} [opts.now]
  */
 export function createDeliveredLog({
-  path = null,
+  path: pathOpt = null,
+  backing = null,
+  debounceMs: debounceOpt,
   maxPerConversation = 400,
   maxAgeMs = 2 * 24 * 60 * 60 * 1000,
   maxTextLength = 2000,
   now = () => Date.now(),
 } = {}) {
+  const path = pathOpt ?? backing?.path ?? null;
+  const debounceMs = debounceOpt ?? backing?.debounceMs ?? 100;
   /** @type {Map<string, {id:any, at:number, last:number, text:string}[]>} */
-  const byConv = new Map();
+  const byConv = backing?.map instanceof Map ? backing.map : new Map();
+  let timer = null;
 
   if (path) {
     try {
@@ -45,12 +58,25 @@ export function createDeliveredLog({
     for (const [k, arr] of byConv) if (!arr.length || arr[arr.length - 1].last < cut) byConv.delete(k);
   };
 
-  const persist = () => {
+  const writeFile = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    pendingLogs.delete(writeFile);
     if (!path) return;
     mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.${process.pid}.tmp`;
+    const tmp = `${path}.${process.pid}.${++tmpSeq}.tmp`;
     writeFileSync(tmp, JSON.stringify(Object.fromEntries(byConv)));
     renameSync(tmp, path);
+  };
+
+  const persist = () => {
+    if (!path) return;
+    if (debounceMs <= 0) return writeFile();
+    if (!timer) {
+      timer = setTimeout(() => { timer = null; try { writeFile(); } catch { /* the next write retries */ } }, debounceMs);
+      timer.unref?.();
+      pendingLogs.add(writeFile);
+      if (!exitHooked) { exitHooked = true; process.once('exit', flushPending); }
+    }
   };
 
   return {
@@ -92,10 +118,18 @@ export function createDeliveredLog({
         .filter((e) => e.last >= sinceMs)
         .map((e) => ({ at: e.at, text: e.text }));
     },
+    /** The oldest time this log still covers (entries older than that were dropped). */
+    horizon() {
+      return now() - maxAgeMs;
+    },
     clear(conversationId) {
       if (conversationId == null) byConv.clear();
       else byConv.delete(String(conversationId));
       persist();
+    },
+    /** Write a pending debounced change now. */
+    flush() {
+      if (timer) writeFile();
     },
   };
 }

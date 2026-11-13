@@ -222,7 +222,7 @@ test('pending checks persist in a file and reload after a restart', async () => 
   w.no = w.make();
   await w.no.start();
   w.no.noteReply(C, 'before restart');
-  await new Promise((r) => setImmediate(r));
+  await w.no.flush();
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).records[0].replies[0].text, 'before restart');
   w.no.stop();
 

@@ -90,6 +90,7 @@ test('delivered log: keeps the newest entries per conversation and survives a re
   const log = createDeliveredLog({ path, now: () => ++t, maxPerConversation: 3 });
   for (let i = 1; i <= 5; i++) log.note('chat-busy', `m${i}`);
   log.note('chat-quiet', 'only one');
+  log.flush(); // file writes are debounced
   assert.deepEqual(log.since('chat-busy').map((e) => e.text), ['m3', 'm4', 'm5']);
   const again = createDeliveredLog({ path, now: () => t });
   assert.deepEqual(again.since('chat-quiet').map((e) => e.text), ['only one']);

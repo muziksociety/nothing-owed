@@ -103,7 +103,7 @@ test('(b) two promises, one done and one running: first item at 5, second at the
   assert.deepEqual(s.wakes.map((x) => x.min), [5, 10, 15]);
 });
 
-test('(c) 1-hour tracked job: parked at 5, no wakes until it ends at 60, then one report and one check', async () => {
+test('(c) 1-hour tracked job: one recheck at 10, parked, no wakes until it ends at 60, then one report and one check', async () => {
   const s = scenario({
     model: (prompt, ctx) => {
       if (ctx.kind === 'report') return 'The render is done: 4 clips, 2.1 GB. Nothing else is open.';
@@ -114,19 +114,16 @@ test('(c) 1-hour tracked job: parked at 5, no wakes until it ends at 60, then on
   s.user();
   s.agent('Starting the 1-hour render now; it will report when done.');
   s.no.trackJob(C, 'render-1', { title: 'render' });
-  await s.to(5);
+  await s.to(10);
   assert.equal(s.no.parked().length, 1);
   await s.to(60);
-  assert.deepEqual(s.wakes, [{ min: 5, kind: 'check' }], 'no wakes while parked');
+  assert.deepEqual(s.wakes.map((x) => x.min), [5, 10], 'no wakes while parked');
   await s.no.finishJob('render-1', { status: 'done', text: '4 clips written, 2.1 GB' });
-  assert.deepEqual(s.wakes, [
-    { min: 5, kind: 'check' },
-    { min: 60, kind: 'report' },
-    { min: 60, kind: 'check' },
-  ]);
+  await s.no.idle();
+  assert.deepEqual(s.wakes.slice(2).map((x) => [x.min, x.kind]), [[60, 'report'], [60, 'check']]);
   assert.deepEqual(s.got, [{ min: 60, text: 'The render is done: 4 clips, 2.1 GB. Nothing else is open.' }]);
   await s.to(180);
-  assert.equal(s.wakes.length, 3);
+  assert.equal(s.wakes.length, 4);
 });
 
 test('(d) untracked long work, back-off off: rechecks every 5 minutes up to 6, then one status', async () => {
@@ -170,16 +167,17 @@ test('(e) restart mid-window and mid-park: nothing lost, the counter continues',
   await s.to(6);
   s.agent('Running the import job; it will report.');
   s.no.trackJob(C, 'import-1', { title: 'import' });
-  await s.to(11);
+  await s.to(15); // STILL_RUNNING at 10 rechecks once, then parks at 15
   assert.equal(s.no.parked().length, 1);
   await s.to(20);
   await s.restart(); // mid-park
   assert.equal(s.no.parked().length, 1);
   assert.deepEqual(s.no.jobs().map((j) => j.id), ['import-1']);
   await s.to(30);
-  assert.equal(s.wakes.length, 2, 'still parked, no wakes');
+  assert.equal(s.wakes.length, 3, 'still parked, no wakes');
   await s.no.finishJob('import-1', { status: 'done', text: '300 rows' });
-  assert.deepEqual(s.wakes.slice(2), [{ min: 30, kind: 'report' }, { min: 30, kind: 'check' }]);
+  await s.no.idle();
+  assert.deepEqual(s.wakes.slice(3).map((x) => [x.min, x.kind]), [[30, 'report'], [30, 'check']]);
   assert.deepEqual(s.got.slice(-1), [{ min: 30, text: 'The import finished: 300 rows.' }]);
   // 4 user/agent messages, the list, the import reply, the report
   assert.equal(s.no.messageCount(C), 7);
@@ -194,8 +192,8 @@ test('(f) tracked job that never finishes: a status at 2 hours, then the check e
   s.agent('Starting the backup; it will report.');
   s.no.trackJob(C, 'backup-1', { title: 'backup' });
   await s.to(600);
-  assert.deepEqual(s.wakes.map((x) => x.min), [5, 125]);
-  assert.deepEqual(s.got, [{ min: 125, text: 'The backup is still running and will report.' }]);
+  assert.deepEqual(s.wakes.map((x) => x.min), [5, 10, 130]);
+  assert.deepEqual(s.got, [{ min: 130, text: 'The backup is still running and will report.' }]);
   assert.equal(s.no.parked().length, 0);
 });
 

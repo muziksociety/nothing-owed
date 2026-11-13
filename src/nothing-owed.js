@@ -1,12 +1,14 @@
 // The scheduler: one fixed-window timer per conversation, a self-audit turn against the host's
 // own send log when it fires, verify checks on the package's own deliveries, dated timers, job
-// tracking for long work, report turns with a code-written fallback, and delivery retry.
+// tracking for long work, report turns with a code-written fallback, delivery retry, missed
+// notices with their own timer, caps and a circuit breaker.
 // Code holds every alarm; the model is only woken to judge and to write.
 import {
   buildPrompt as defaultBuildPrompt,
   buildReportPrompt as defaultBuildReportPrompt,
   parseCheckReply,
   clipText,
+  isJunkReply,
 } from './outcome.js';
 import { createMemoryStore } from './stores.js';
 import { createDeliveredLog } from './delivered-log.js';
@@ -14,9 +16,11 @@ import { createDeliveredLog } from './delivered-log.js';
 const VERIFY_KINDS = new Set(['check', 'report']); // replies the user saw that may hold a promise
 const CODE_KINDS = new Set(['giveup', 'fallback', 'missed']); // code-written lines: no promise in them
 const MAX_TIMER_MS = 2 ** 31 - 1;
-const STORE_VERSION = 3;
-const DAY_MS = 24 * 60 * 60 * 1000;
-const ECHO_MS = 60 * 1000; // a package delivery routed back through noteReply within this long is an echo
+const STORE_VERSION = 4;
+const MIN_MS = 60 * 1000;
+const DAY_MS = 24 * 60 * MIN_MS;
+const ECHO_MS = MIN_MS; // a package delivery routed back through noteReply within this long is an echo
+const DUP_WINDOW_MS = 10 * MIN_MS;
 const OWN_KEEP = 20;
 const LOST_TEXT = 'the work was interrupted by a restart';
 
@@ -27,11 +31,21 @@ const newId = (prefix, t) => `${prefix}_${t.toString(36)}${rand()}`;
 const copy = (v) => JSON.parse(JSON.stringify(v));
 const isRunning = (o) => o === 'running' || o === 'deliver_running';
 const byDue = (a, b) => a.due - b.due;
+const hhmm = (t) => new Date(t).toISOString().slice(11, 16);
 
-/** The default give-up line. `reason` is 'failed' (checks kept failing) or 'still_running'. */
-export function defaultGiveUpText({ reason } = {}) {
-  if (reason === 'still_running') return 'Something I promised you earlier is still running, and I am no longer watching it. Ask me again if it is still open.';
-  return 'I could not check on what I promised you earlier. Ask me again if it is still open.';
+/**
+ * The default code-written lines. `reason`: 'failed' (checks kept failing), 'still_running' (the
+ * last check had nothing but STILL_RUNNING), 'verify_capped', 'daily_cap' (with `until`) or
+ * 'due_limit'. None of them claims a promise was made.
+ */
+export function defaultGiveUpText({ reason, until } = {}) {
+  switch (reason) {
+    case 'still_running': return "Something I started for you may still be running, and I'm no longer watching it. Ask me if you need an update.";
+    case 'verify_capped': return "I'm no longer watching this for you automatically. Ask me if anything is still open.";
+    case 'daily_cap': return `I've hit today's limit for checking on promises; I'll check again at ${hhmm(until)} UTC.`;
+    case 'due_limit': return "I can't hold another reminder here. Ask me again closer to the time.";
+    default: return "I may have said I'd follow up on something, and I couldn't check it. Ask me if anything is still open.";
+  }
 }
 
 /** The code-written report for a job whose report turn failed or declined: "<title> <status>: <first line>". */
@@ -46,32 +60,50 @@ export function fallbackReportText(job) {
  */
 export function createNothingOwed(options = {}) {
   const {
-    delayMs = 5 * 60 * 1000,
+    delayMs = 5 * MIN_MS,
     maxRechecks = 6,
-    backoffMs = [15, 30, 60, 120].map((m) => m * 60 * 1000),
-    busyRetryMs = 60 * 1000,
-    deliveredLookbackMs = 10 * 60 * 1000,
+    backoffMs = [15, 30, 60, 120].map((m) => m * MIN_MS),
+    busyRetryMs = MIN_MS,
+    busyStuckMs = 30 * MIN_MS,
+    deliveredLookbackMs = 10 * MIN_MS,
     maxReplies = 12,
     maxTextLength = 300,
     maxReportLength = 1500,
     maxDeliveredInPrompt = 40,
-    jobTimeoutMs = 2 * 60 * 60 * 1000,
-    turnTimeoutMs = 3 * 60 * 1000,
+    jobTimeoutMs = 2 * 60 * MIN_MS,
+    turnTimeoutMs = 3 * MIN_MS,
+    callbackTimeoutMs = 30 * 1000,
     maxVerifyDepth = 3,
     maxDueMs = 30 * DAY_MS,
+    maxDueDepth = 10,
+    maxDatedPerConversation = 5,
     maxConcurrent = 2,
+    maxConcurrentLimit = 8,
     dailyCap = 60,
-    retryMs = 5 * 60 * 1000,
+    dailyCapReserve = 10,
+    globalDailyCap = 1000,
+    circuitFailures = 5,
+    circuitPauseMs = 15 * MIN_MS,
+    circuitMaxPauseMs = 2 * 60 * MIN_MS,
+    retryMs = 5 * MIN_MS,
     maxDeliveryAttempts = 12,
+    missedRetryMs = 15 * MIN_MS,
+    missedMaxRetryMs = 6 * 60 * MIN_MS,
+    idlePruneMs = 30 * DAY_MS,
+    saveDebounceMs = 100,
     userLabel = 'the user',
+    timeZone,
     store = createMemoryStore(),
     runTurn,
     deliver,
     getDelivered,
     isUserBusy,
     isPermanentError = () => false,
+    isJunk = isJunkReply,
     onJobFinished,
     onStartJobs,
+    onTurnStart,
+    onTurnEnd,
     giveUpText = defaultGiveUpText,
     onEvent = noop,
     onUsage,
@@ -94,26 +126,34 @@ export function createNothingOwed(options = {}) {
   // Timed rechecks: maxRechecks at delayMs, then one per back-off step. The last one asks for a status.
   const totalRechecks = maxRechecks + backoffMs.length;
   const recheckDelay = (done) => (done < maxRechecks ? delayMs : backoffMs[done - maxRechecks]);
-  const slots = maxConcurrent > 0 ? maxConcurrent : Infinity;
 
-  const deliveredLog = options.deliveredLog || createDeliveredLog({ now });
+  const deliveredLog = options.deliveredLog || createDeliveredLog({ now, backing: store.deliveredBacking });
   const readDelivered = getDelivered || ((id, since) => deliveredLog.since(id, since));
 
   // Check records: state 'pending' (one per conversation, waits for due), 'running', 'parked'
-  // (waits for jobs; due is the job timeout) or 'dated' (a DUE timer; any number per conversation).
+  // (waits for jobs; due is the job timeout) or 'dated' (a DUE timer).
   let records = [];
-  let reports = []; // finished jobs whose report turn is still owed
+  let reports = []; // finished jobs whose report is still owed
   let counters = {}; // conversationId -> messages so far
   let jobs = {}; // jobId -> open tracked job
   let outbox = []; // deliveries that failed and wait for a retry
-  let missed = {}; // conversationId -> full texts of deliveries that were given up on
+  let missed = {}; // conversationId -> [{ text, at, due, wait }] given-up deliveries, retried on their own timer
   let turnsByDay = {}; // conversationId -> { day, n } model turns today
+  let globalTurns = { day: 0, n: 0, told: false };
+  let notices = {}; // conversationId -> { capDay, gaveUp }
+  let circuit = { fails: 0, openUntil: 0, pauseMs: 0 };
+  let lastActive = {}; // conversationId -> last activity time
   let timer = null;
   let started = false;
+  let loaded = false;
   const inflight = new Set();
-  const own = new Map(); // conversationId -> recent package deliveries [{ text, at, done }]
+  const own = new Map(); // conversationId -> recent package deliveries [{ text, at, done, jobId }]
+  const missedLocks = new Map();
+  const activeTurns = new Set();
   let active = 0;
+  let woken = 0;
   const waiters = [];
+  let probing = false;
 
   const emit = (event) => {
     try { onEvent({ at: now(), ...event }); } catch { /* a broken listener never breaks the loop */ }
@@ -124,14 +164,79 @@ export function createNothingOwed(options = {}) {
     return p.finally(() => inflight.delete(p));
   };
 
-  const save = async () => {
+  // Every host callback gets callbackTimeoutMs.
+  const timed = (label, fn) => new Promise((resolve, reject) => {
+    let done = false;
+    let h = null;
+    if (callbackTimeoutMs > 0 && Number.isFinite(callbackTimeoutMs)) {
+      h = setTimer(() => {
+        if (done) return;
+        done = true;
+        const error = new Error(`nothing-owed: ${label} did not settle within ${callbackTimeoutMs} ms`);
+        error.code = 'CALLBACK_TIMEOUT';
+        reject(error);
+      }, Math.min(callbackTimeoutMs, MAX_TIMER_MS));
+    }
+    Promise.resolve().then(fn).then(
+      (v) => { if (done) return; done = true; if (h != null) clearTimer(h); resolve(v); },
+      (e) => { if (done) return; done = true; if (h != null) clearTimer(h); reject(e); },
+    );
+  });
+
+  // ---- persistence: nothing before the load, debounced writes, a sync final save -------------
+
+  const live = (cid) =>
+    records.some((r) => r.conversationId === cid) || reports.some((p) => p.conversationId === cid) ||
+    Object.values(jobs).some((j) => j.conversationId === cid) || outbox.some((o) => o.conversationId === cid) || missed[cid]?.length;
+
+  const pruneIdle = () => {
+    const cut = now() - idlePruneMs;
+    for (const [cid, t] of Object.entries(lastActive)) {
+      if (t >= cut || live(cid)) continue;
+      delete lastActive[cid];
+      delete counters[cid];
+      delete turnsByDay[cid];
+      delete notices[cid];
+      own.delete(cid);
+    }
     const today = Math.floor(now() / DAY_MS);
     for (const [k, v] of Object.entries(turnsByDay)) if (v.day < today) delete turnsByDay[k];
-    try {
-      await store.save(copy({ version: STORE_VERSION, records, reports, counters, jobs, outbox, missed, turnsByDay }));
-    } catch (error) {
-      emit({ type: 'error', stage: 'store', error });
+  };
+
+  const snapshot = () => {
+    pruneIdle();
+    return copy({ version: STORE_VERSION, records, reports, counters, jobs, outbox, missed, turnsByDay, globalTurns, notices, circuit, lastActive });
+  };
+
+  let saveTimer = null;
+  let writing = null;
+  let again = false;
+  const writeNow = () => {
+    if (!loaded) return Promise.resolve();
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    if (writing) { again = true; return writing; }
+    let r;
+    try { r = store.save(snapshot()); } catch (error) { emit({ type: 'error', stage: 'store', error }); }
+    writing = Promise.resolve(r)
+      .catch((error) => emit({ type: 'error', stage: 'store', error }))
+      .finally(() => {
+        writing = null;
+        if (again) { again = false; void writeNow(); }
+      });
+    return writing;
+  };
+  const save = () => {
+    if (!loaded) return Promise.resolve();
+    if (!(saveDebounceMs > 0)) return writeNow();
+    if (!saveTimer) {
+      saveTimer = setTimeout(() => { saveTimer = null; void writeNow(); }, saveDebounceMs);
+      saveTimer.unref?.();
     }
+    return Promise.resolve();
+  };
+  const flushAll = async () => {
+    await writeNow();
+    while (writing) await writing;
   };
 
   const keepFirst = (list) => {
@@ -144,66 +249,104 @@ export function createNothingOwed(options = {}) {
   const convBusy = (cid) =>
     records.some((r) => r.conversationId === cid && r.state === 'running') || reports.some((p) => p.conversationId === cid && p.state === 'running');
   const openJobIds = (cid) => Object.values(jobs).filter((j) => j.conversationId === cid).map((j) => j.id);
-  const count = (cid) => (counters[cid] = (counters[cid] || 0) + 1);
+  const touch = (cid) => { lastActive[cid] = now(); };
+  const count = (cid) => { touch(cid); return (counters[cid] = (counters[cid] || 0) + 1); };
   const recCopy = (r) => ({ ...r, replies: r.replies.slice(), ...(r.parkedOn ? { parkedOn: r.parkedOn.slice() } : {}) });
+
+  // ---- the circuit breaker ------------------------------------------------------------------
+
+  const circuitOn = () => circuitFailures > 0;
+  const circuitOpen = () => circuitOn() && circuit.openUntil > now();
+  const modelBlocked = () => circuitOn() && circuit.pauseMs > 0 && (circuitOpen() || probing);
+  const turnOk = (cid) => {
+    if (circuit.pauseMs > 0) emit({ type: 'circuit_closed', after: circuit.fails });
+    circuit = { fails: 0, openUntil: 0, pauseMs: 0 };
+    if (notices[cid]?.gaveUp) delete notices[cid].gaveUp;
+  };
+  const turnFailed = () => {
+    if (!circuitOn()) return;
+    circuit.fails++;
+    if (circuit.pauseMs > 0) circuit.pauseMs = Math.min(circuit.pauseMs * 2, circuitMaxPauseMs);
+    else if (circuit.fails >= circuitFailures) circuit.pauseMs = circuitPauseMs;
+    else return;
+    circuit.openUntil = now() + circuit.pauseMs;
+    emit({ type: 'circuit_open', fails: circuit.fails, until: circuit.openUntil, pauseMs: circuit.pauseMs });
+  };
 
   const arm = () => {
     if (timer != null) { clearTimer(timer); timer = null; }
     if (!started) return;
+    const gate = circuitOpen() ? circuit.openUntil : 0;
     let next = Infinity;
     for (const r of records) {
-      if ((r.state === 'pending' || r.state === 'parked' || r.state === 'dated') && r.due < next && !convBusy(r.conversationId)) next = r.due;
+      if ((r.state === 'pending' || r.state === 'parked' || r.state === 'dated') && !convBusy(r.conversationId)) next = Math.min(next, Math.max(r.due, gate));
     }
-    for (const p of reports) if (p.state === 'pending' && p.due < next && !convBusy(p.conversationId)) next = p.due;
+    for (const p of reports) if (p.state === 'pending' && !convBusy(p.conversationId)) next = Math.min(next, Math.max(p.due, gate));
     for (const o of outbox) if (!o.sending && o.due < next) next = o.due;
+    for (const list of Object.values(missed)) for (const m of list || []) if (m.due < next) next = m.due;
     if (next === Infinity) return;
     const wait = Math.min(Math.max(0, next - now()), MAX_TIMER_MS);
     timer = setTimer(() => { timer = null; void track(api.tick()); }, wait);
   };
 
-  // ---- model turns: a shared slot pool, a daily cap, a timeout --------------------------------
+  // ---- model turns: a growing slot pool (never held while a host callback runs), caps, timeout --
 
-  const acquire = () => {
-    if (active < slots) { active++; return Promise.resolve(); }
-    return new Promise((resolve) => waiters.push(resolve));
+  const slots = () => {
+    if (!(maxConcurrent > 0)) return Infinity;
+    return Math.min(Math.max(maxConcurrentLimit, maxConcurrent), maxConcurrent + Math.floor(waiters.length / 25));
   };
-  const release = () => {
-    const next = waiters.shift();
-    if (next) next();
-    else active--;
+  const pump = () => {
+    while (waiters.length && active + woken < slots()) { woken++; waiters.shift()(true); }
   };
+  const gate = () => {
+    if (!waiters.length && active + woken < slots()) return Promise.resolve(false);
+    return new Promise((resolve) => { waiters.push(resolve); pump(); });
+  };
+  const release = () => { active--; pump(); };
 
   const nextDay = () => (Math.floor(now() / DAY_MS) + 1) * DAY_MS;
-  const spendTurn = (cid) => {
+  // null when the turn may run; 'conv' or 'global' when a cap is reached.
+  const spendTurn = (cid, reason) => {
     const day = Math.floor(now() / DAY_MS);
+    if (globalTurns.day !== day) globalTurns = { day, n: 0, told: false };
+    if (globalDailyCap > 0 && globalTurns.n >= globalDailyCap) {
+      if (!globalTurns.told) { globalTurns.told = true; emit({ type: 'global_daily_cap', cap: globalDailyCap, until: nextDay() }); }
+      return 'global';
+    }
     let u = turnsByDay[cid];
     if (!u || u.day !== day) u = turnsByDay[cid] = { day, n: 0 };
-    if (dailyCap > 0 && u.n >= dailyCap) return false;
+    const limit = reason === 'window' || reason === 'due' ? dailyCap : Math.max(0, dailyCap - dailyCapReserve);
+    if (dailyCap > 0 && u.n >= limit) return 'conv';
     u.n++;
-    return true;
+    globalTurns.n++;
+    return null;
   };
 
   const callTurn = async (cid, prompt, ctx) => {
     const ac = new AbortController();
     const limit = turnTimeoutMs > 0 && Number.isFinite(turnTimeoutMs) ? Math.min(turnTimeoutMs, MAX_TIMER_MS) : 0;
     let handle = null;
+    activeTurns.add(cid);
+    if (onTurnStart) { try { await timed('onTurnStart', () => onTurnStart(cid, { ...ctx })); } catch (error) { emit({ type: 'error', stage: 'onTurnStart', conversationId: cid, error }); } }
     const run = Promise.resolve().then(() => runTurn(cid, prompt, { ...ctx, signal: ac.signal }));
     run.catch(noop);
-    if (!limit) return run;
-    const timeout = new Promise((_, reject) => {
-      handle = setTimer(() => {
-        handle = null;
-        const error = new Error(`nothing-owed: the ${ctx.kind} turn timed out after ${turnTimeoutMs} ms`);
-        error.code = 'TURN_TIMEOUT';
-        emit({ type: 'turn_timeout', conversationId: cid, kind: ctx.kind, checkId: ctx.checkId, jobId: ctx.jobId });
-        try { ac.abort(error); } catch { /* ignore */ }
-        reject(error);
-      }, limit);
-    });
     try {
+      if (!limit) return await run;
+      const timeout = new Promise((_, reject) => {
+        handle = setTimer(() => {
+          handle = null;
+          const error = new Error(`nothing-owed: the ${ctx.kind} turn timed out after ${turnTimeoutMs} ms`);
+          error.code = 'TURN_TIMEOUT';
+          emit({ type: 'turn_timeout', conversationId: cid, kind: ctx.kind, checkId: ctx.checkId, jobId: ctx.jobId });
+          try { ac.abort(error); } catch { /* ignore */ }
+          reject(error);
+        }, limit);
+      });
       return await Promise.race([run, timeout]);
     } finally {
       if (handle != null) clearTimer(handle);
+      activeTurns.delete(cid);
+      if (onTurnEnd) { try { await timed('onTurnEnd', () => onTurnEnd(cid, { ...ctx })); } catch (error) { emit({ type: 'error', stage: 'onTurnEnd', conversationId: cid, error }); } }
     }
   };
 
@@ -216,6 +359,9 @@ export function createNothingOwed(options = {}) {
   };
 
   const parse = (text) => {
+    let junk = false;
+    try { junk = !!isJunk(String(text ?? '')); } catch { junk = false; }
+    if (junk) return { outcome: 'failed', text: '', junk: true };
     const r = parseOutcome(text, { failTexts });
     if (typeof r === 'string') {
       if (r === 'deliver' || r === 'deliver_running' || r === 'due') {
@@ -225,13 +371,49 @@ export function createNothingOwed(options = {}) {
       }
       return { outcome: r, text: '' };
     }
-    return { outcome: r?.outcome ?? 'failed', text: r?.text ?? '', dueAt: r?.dueAt };
+    return { outcome: r?.outcome ?? 'failed', text: r?.text ?? '', dueAt: r?.dueAt, running: r?.running };
+  };
+
+  // The part of a check run that waits: busy user, host send log, a free slot. No slot is held
+  // while a host callback runs. Resolves { busy } or { delivered } with a slot taken.
+  const waitForTurn = async (cid, rec) => {
+    for (;;) {
+      if (isUserBusy) {
+        let busy;
+        try { busy = !!(await timed('isUserBusy', () => isUserBusy(cid))); } catch (error) {
+          emit({ type: 'error', stage: 'isUserBusy', conversationId: cid, error });
+          busy = true; // unknown: the user's turn wins
+        }
+        if (busy) {
+          rec.busySince ??= now();
+          if (!rec.busyStuck && now() - rec.busySince >= busyStuckMs) {
+            rec.busyStuck = true;
+            emit({ type: 'busy_stuck', conversationId: cid, checkId: rec.id ?? null, since: rec.busySince });
+          }
+          return { busy: true };
+        }
+        delete rec.busySince;
+        delete rec.busyStuck;
+      }
+      let hostDelivered = null;
+      if (getDelivered && rec.since != null) hostDelivered = (await timed('getDelivered', () => getDelivered(cid, rec.since))) || [];
+      const wasWoken = await gate();
+      if (wasWoken) woken--;
+      // a waiter the pump woke had a slot counted for it: it takes it (re-checking here could
+      // flip at the backlog boundary and loop forever)
+      if (wasWoken || active < slots()) {
+        active++;
+        // the built-in log is read again now, synchronously, so the list is current
+        const delivered = hostDelivered ?? (rec.since != null ? deliveredLog.since(cid, rec.since) : []);
+        return { delivered };
+      }
+    }
   };
 
   // ---- delivery with retry ----------------------------------------------------------------
 
-  const ownAdd = (cid, text) => {
-    const e = { text: flat(text), at: now(), done: false };
+  const ownAdd = (cid, text, jobId) => {
+    const e = { text: flat(text), at: now(), done: false, jobId: jobId ?? null };
     const arr = own.get(cid) || [];
     arr.push(e);
     if (arr.length > OWN_KEEP) arr.shift();
@@ -246,10 +428,10 @@ export function createNothingOwed(options = {}) {
 
   // One send. On success the package counts it and logs it in the built-in delivered log.
   const sendOnce = async (cid, text, meta) => {
-    const e = ownAdd(cid, text);
+    const e = ownAdd(cid, text, meta.jobId);
     let res;
     try {
-      res = await deliver(cid, text, { kind: meta.kind, checkId: meta.checkId ?? null, jobId: meta.jobId ?? null });
+      res = await timed('deliver', () => deliver(cid, text, { kind: meta.kind, checkId: meta.checkId ?? null, jobId: meta.jobId ?? null }));
     } catch (error) {
       ownDrop(cid, e);
       throw error;
@@ -261,40 +443,52 @@ export function createNothingOwed(options = {}) {
     return { ids: res && typeof res === 'object' && Array.isArray(res.ids) ? res.ids : undefined };
   };
 
-  // Send every "Missed:" notice still owed in this conversation. Resolves false if one failed.
-  const sendMissed = async (cid) => {
+  // Send the owed "Missed:" notices of one conversation, one sender at a time. `force` ignores
+  // their timers (before a package delivery). Resolves false if one failed.
+  const runMissed = async (cid, force) => {
     while (missed[cid]?.length) {
-      const text = missed[cid][0];
+      const m = missed[cid][0];
+      if (!force && m.due > now()) return true;
       try {
-        await sendOnce(cid, `Missed: ${text}`, { kind: 'missed' });
+        await sendOnce(cid, `Missed: ${m.text}`, { kind: 'missed' });
       } catch (error) {
-        emit({ type: 'error', stage: 'deliver', conversationId: cid, error });
+        m.wait = Math.min((m.wait || missedRetryMs) * 2, missedMaxRetryMs);
+        m.due = now() + m.wait;
+        emit({ type: 'missed_retry', conversationId: cid, retryInMs: m.wait, error });
+        void save();
         return false;
       }
-      if (missed[cid]?.[0] === text) missed[cid].shift();
+      if (missed[cid]?.[0] === m) missed[cid].shift();
       emit({ type: 'missed_notice', conversationId: cid });
     }
     if (missed[cid] && !missed[cid].length) delete missed[cid];
+    void save();
     return true;
+  };
+  const sendMissed = (cid, force = true) => {
+    const prev = missedLocks.get(cid) || Promise.resolve();
+    const p = prev.then(() => runMissed(cid, force));
+    const settled = p.catch(() => false);
+    missedLocks.set(cid, settled);
+    void settled.then(() => { if (missedLocks.get(cid) === settled) missedLocks.delete(cid); });
+    return p;
   };
 
   const sendWithMissed = async (cid, text, meta) => {
-    await sendMissed(cid);
+    if (missed[cid]?.length) await sendMissed(cid, true);
     return sendOnce(cid, text, meta);
   };
 
   const outboxIds = (item) => ({ conversationId: item.conversationId, kind: item.kind, checkId: item.checkId, jobId: item.jobId });
 
-  // A delivery attempt failed: queue a retry or give up.
+  // A delivery attempt failed: queue a retry or give up (the text becomes a missed notice).
   const failDelivery = (item, error) => {
     const permanent = (() => { try { return !!isPermanentError(error); } catch { return false; } })();
     if (permanent || item.attempts >= maxDeliveryAttempts) {
       outbox = outbox.filter((o) => o !== item);
-      (missed[item.conversationId] ||= []).push(item.text);
+      const t = now();
+      (missed[item.conversationId] ||= []).push({ text: item.text, at: t, due: permanent ? Infinity : t + missedRetryMs, wait: missedRetryMs });
       emit({ type: 'delivery_failed', ...outboxIds(item), attempts: item.attempts, permanent, error });
-      // A fresh check: it sends the Missed notice first, then judges what is still owed. Not
-      // after a permanent error (a blocked user, a deleted chat): the host gets flushMissed().
-      if (!permanent) scheduleVerify(item.conversationId, item.text, (item.depth || 0) + 1);
       return;
     }
     const wait = Number.isFinite(error?.retryAfterMs) && error.retryAfterMs >= 0 ? error.retryAfterMs : retryMs;
@@ -304,7 +498,7 @@ export function createNothingOwed(options = {}) {
   };
 
   // First attempt for a text the package produced. Resolves { ok, ids }. A failure is kept for
-  // retry; it never reaches runTurn again.
+  // retry; it never reaches runTurn again. A deliver() that hangs times out into the outbox.
   const deliverOwed = async (cid, text, meta) => {
     try {
       const { ids } = await sendWithMissed(cid, text, meta);
@@ -323,7 +517,7 @@ export function createNothingOwed(options = {}) {
       const { ids } = await sendWithMissed(item.conversationId, item.text, item);
       outbox = outbox.filter((o) => o !== item);
       emit({ type: 'delivery_recovered', ...outboxIds(item), attempt: item.attempts, ids });
-      if (VERIFY_KINDS.has(item.kind)) scheduleVerify(item.conversationId, item.text, (item.depth || 0) + 1);
+      if (VERIFY_KINDS.has(item.kind)) scheduleVerify(item.conversationId, item.text, (item.depth || 0) + 1, undefined, item.dueDepth);
     } catch (error) {
       failDelivery(item, error);
     } finally {
@@ -333,24 +527,41 @@ export function createNothingOwed(options = {}) {
     arm();
   };
 
-  const giveUp = async (cid, reason, ids) => {
+  // A code-written line to the user (never a model turn).
+  const sendLine = async (cid, reason, ids = {}, extra = {}) => {
     let text;
-    try { text = giveUpText({ conversationId: cid, reason, ...ids }); } catch { text = defaultGiveUpText({ reason }); }
+    try { text = giveUpText({ conversationId: cid, reason, ...ids, ...extra }); } catch { text = defaultGiveUpText({ reason, ...extra }); }
     text = String(text ?? '').trim();
-    if (!text) return;
+    if (!text) return false;
     const sent = await deliverOwed(cid, text, { kind: 'giveup', ...ids });
     emit({ type: 'gave_up', conversationId: cid, reason, ...ids, delivered: sent.ok });
+    return sent.ok;
   };
 
-  // An exact copy of something already delivered, queued or missed is never sent twice.
-  const isDuplicate = (cid, body, delivered, since) => {
+  const capLine = async (cid, ids) => {
+    const day = Math.floor(now() / DAY_MS);
+    const n = (notices[cid] ||= {});
+    if (n.capDay === day) return;
+    n.capDay = day;
+    await sendLine(cid, 'daily_cap', ids, { until: nextDay() });
+  };
+
+  // An exact copy is not sent twice. Checks compare with copies delivered after the record's
+  // previous run or in the last 10 minutes, and with queued and missed texts; dated checks are
+  // never compared; reports only with copies of the same job.
+  const isDuplicate = (cid, body, { delivered = [], start, jobId, mode }) => {
+    if (mode === 'due') return false;
     const f = flat(body);
     if (!f) return false;
     const same = (t) => { const x = flat(t); return x === f || x === `Missed: ${f}`; };
+    if (mode === 'report') {
+      return outbox.some((o) => o.conversationId === cid && o.jobId === jobId && same(o.text)) ||
+        (own.get(cid) || []).some((e) => e.done && e.jobId === jobId && same(e.text));
+    }
     if (outbox.some((o) => o.conversationId === cid && same(o.text))) return true;
-    if ((missed[cid] || []).some(same)) return true;
-    if ((delivered || []).some((d) => same(d.text))) return true;
-    return (own.get(cid) || []).some((e) => e.done && e.at >= since && same(e.text));
+    if ((missed[cid] || []).some((m) => same(m.text))) return true;
+    if (delivered.some((d) => d.at >= start && same(d.text))) return true;
+    return (own.get(cid) || []).some((e) => e.done && e.at >= start && same(e.text));
   };
 
   // ---- check records ----------------------------------------------------------------------
@@ -362,15 +573,21 @@ export function createNothingOwed(options = {}) {
       cur.replies = keepFirst([...rec.replies, ...cur.replies]);
       cur.rechecks = Math.max(cur.rechecks || 0, rechecks);
       cur.depth = Math.max(cur.depth || 0, rec.depth || 0);
+      cur.dueDepth = Math.max(cur.dueDepth || 0, rec.dueDepth || 0);
+      cur.jobRecheck = cur.jobRecheck || rec.jobRecheck;
+      cur.lastRunAt = Math.max(cur.lastRunAt || 0, rec.lastRunAt || 0) || undefined;
     } else {
-      records.push({ ...rec, state: 'pending', due, rechecks, parkedOn: undefined, parkedAt: undefined, timedOut: undefined });
+      records.push({ ...rec, state: 'pending', due, rechecks, fresh: false, parkedOn: undefined, parkedAt: undefined, timedOut: undefined, busySince: undefined, busyStuck: undefined });
     }
   };
 
   // One follow-up check on a reply the user saw that may itself hold a promise.
-  const scheduleVerify = (cid, text, depth, at) => {
+  // `runAt`: when the run that delivered the text started; the verify counts it as its previous
+  // run, so the duplicate guard covers what that run sent.
+  const scheduleVerify = (cid, text, depth, at, dueDepth = 0, runAt) => {
     if (depth > maxVerifyDepth) {
       emit({ type: 'verify_capped', conversationId: cid, depth });
+      void track(sendLine(cid, 'verify_capped').then(() => save()));
       return null;
     }
     const t = at ?? now();
@@ -379,15 +596,18 @@ export function createNothingOwed(options = {}) {
     if (rec) {
       rec.replies = keepFirst([...rec.replies, reply]);
       rec.depth = Math.max(rec.depth || 0, depth);
+      rec.dueDepth = Math.max(rec.dueDepth || 0, dueDepth || 0);
+      rec.lastRunAt = Math.min(rec.lastRunAt ?? Infinity, runAt ?? t);
     } else {
-      rec = { id: newId('chk', t), conversationId: cid, state: 'pending', kind: 'verify', due: t + delayMs, replies: [reply], rechecks: 0, depth };
+      rec = { id: newId('chk', t), conversationId: cid, state: 'pending', kind: 'verify', due: t + delayMs, replies: [reply], rechecks: 0, depth, dueDepth: dueDepth || 0, lastRunAt: runAt ?? t };
       records.push(rec);
     }
     emit({ type: 'verify_scheduled', conversationId: cid, checkId: rec.id, depth, due: rec.due });
     return rec;
   };
 
-  // A DUE timer: at that time, a check runs with the replies that made the promise.
+  // A DUE timer: at that time, a check runs with the replies that made the promise. Bounded by
+  // maxDueDepth (a chain of DUE answers) and maxDatedPerConversation.
   const addDated = (rec, dueAt) => {
     const cid = rec.conversationId;
     const cur = records.find((r) => r.conversationId === cid && r.state === 'dated' && Math.abs(r.due - dueAt) <= ECHO_MS);
@@ -395,11 +615,19 @@ export function createNothingOwed(options = {}) {
       const seen = new Set(cur.replies.map((x) => `${x.at}|${x.text}`));
       cur.replies = keepFirst([...cur.replies, ...rec.replies.filter((x) => !seen.has(`${x.at}|${x.text}`))]);
       emit({ type: 'dated', conversationId: cid, checkId: cur.id, due: cur.due });
-      return;
+      return true;
     }
-    const d = { id: newId('due', now()), conversationId: cid, state: 'dated', kind: 'due', due: dueAt, dueAt, replies: rec.replies.slice(), rechecks: 0, depth: rec.depth || 0 };
+    const dueDepth = (rec.dueDepth || 0) + 1;
+    const count = records.filter((r) => r.conversationId === cid && r.state === 'dated').length;
+    if (dueDepth > maxDueDepth || count >= maxDatedPerConversation) {
+      emit({ type: 'due_limit', conversationId: cid, checkId: rec.id ?? null, dueDepth, dated: count });
+      void track(sendLine(cid, 'due_limit', { checkId: rec.id ?? null }).then(() => save()));
+      return false;
+    }
+    const d = { id: newId('due', now()), conversationId: cid, state: 'dated', kind: 'due', due: dueAt, dueAt, replies: rec.replies.slice(), rechecks: 0, depth: rec.depth || 0, dueDepth };
     records.push(d);
     emit({ type: 'dated', conversationId: cid, checkId: d.id, due: dueAt });
+    return true;
   };
 
   const validDue = (dueAt) => Number.isFinite(dueAt) && dueAt > now() && dueAt - now() <= maxDueMs;
@@ -445,84 +673,111 @@ export function createNothingOwed(options = {}) {
 
   const reasonOf = (rec, timeout) => {
     if (timeout) return 'park_timeout';
+    if (rec.kind === 'due' && !(rec.rechecks > 0)) return 'due';
+    if (rec.fresh) return 'window';
     if ((rec.rechecks || 0) > 0) return 'recheck';
     if (rec.kind === 'verify') return 'verify';
-    if (rec.kind === 'due') return 'due';
     return 'window';
   };
 
-  async function runCheck(rec, { timeout = false, from = 'pending' } = {}) {
+  async function runCheck(rec, { timeout = false, from = 'pending', probe = false } = {}) {
     const cid = rec.conversationId;
     const t0 = now();
     const rechecks = rec.rechecks || 0;
     const verifies = []; // [text, depth] for deliveries that landed
     let datedAt = null;
+    let suppressed = false;
 
     const finish = async (outcome) => {
       records = records.filter((r) => r !== rec);
       const open = openJobIds(cid);
-      const unresolved = isRunning(outcome) || outcome === 'failed';
       if (outcome === 'busy' || outcome === 'capped') {
         const later = outcome === 'busy' ? now() + busyRetryMs : nextDay();
         if (from === 'parked' || from === 'dated') records.push({ ...rec, state: from, due: later });
-        else requeue(rec, later, rechecks);
+        else {
+          requeue(rec, later, rechecks);
+          const cur = find(cid, 'pending');
+          if (outcome === 'capped' && cur) cur.capped = true;
+          if (cur && rec.fresh) cur.fresh = true;
+          if (cur && rec.busySince) { cur.busySince = rec.busySince; cur.busyStuck = rec.busyStuck; }
+        }
+      } else if (suppressed) {
+        // the circuit is open: keep the last step for after it closes
+        requeue(rec, Math.max(circuit.openUntil, now() + delayMs), rechecks);
       } else if (timeout) {
         if (open.length) park(rec, open, { timedOut: true });
-      } else if (unresolved && open.length) {
+      } else if (outcome === 'failed' && rechecks < totalRechecks) {
+        requeue(rec, now() + recheckDelay(rechecks), rechecks + 1);
+      } else if (isRunning(outcome) && open.length && rec.jobRecheck) {
         park(rec, open);
-      } else if (unresolved && rechecks < totalRechecks) {
+      } else if (isRunning(outcome) && open.length) {
+        rec.jobRecheck = true; // one recheck at delayMs before parking on the job
+        requeue(rec, now() + delayMs, Math.min(rechecks + 1, totalRechecks));
+      } else if (isRunning(outcome) && rechecks < totalRechecks) {
         requeue(rec, now() + recheckDelay(rechecks), rechecks + 1);
       }
       if (datedAt != null) addDated(rec, datedAt);
-      for (const [text, depth] of verifies) scheduleVerify(cid, text, depth);
+      for (const [text, depth] of verifies) scheduleVerify(cid, text, depth, undefined, rec.dueDepth, rec.lastRunAt);
       await save();
       arm();
       return outcome;
     };
 
-    await acquire();
-    let held = true;
+    const reason = reasonOf(rec, timeout);
+    rec.since = (rec.replies[0]?.at ?? now()) - deliveredLookbackMs;
+    let held = false;
     const free = () => { if (held) { held = false; release(); } };
     try {
-      if (isUserBusy) {
-        let busy = false;
-        try { busy = !!(await isUserBusy(cid)); } catch (error) { emit({ type: 'error', stage: 'isUserBusy', conversationId: cid, error }); }
-        if (busy) {
-          free();
+      let delivered;
+      try {
+        const w = await waitForTurn(cid, rec);
+        if (w.busy) {
           emit({ type: 'yielded', conversationId: cid, checkId: rec.id });
           return await finish('busy');
         }
+        held = true;
+        delivered = w.delivered;
+      } catch (error) {
+        emit({ type: 'error', stage: 'getDelivered', conversationId: cid, checkId: rec.id, error });
+        emit({ type: 'failed', conversationId: cid, checkId: rec.id, recheck: rechecks + 1, ms: now() - t0 });
+        return await finish('failed');
       }
-      if (!spendTurn(cid)) {
+      const capped = spendTurn(cid, reason);
+      if (capped) {
         free();
-        emit({ type: 'daily_cap', conversationId: cid, checkId: rec.id, until: nextDay() });
+        emit({ type: 'daily_cap', conversationId: cid, checkId: rec.id, scope: capped, until: nextDay() });
+        await capLine(cid, { checkId: rec.id });
         return await finish('capped');
       }
-      if (missed[cid]?.length) await sendMissed(cid);
+      if (missed[cid]?.length) await sendMissed(cid, true);
       if (timeout) emit({ type: 'park_timeout', conversationId: cid, checkId: rec.id, jobIds: openJobIds(cid) });
 
-      const isLastCheck = timeout || (rechecks >= totalRechecks && !openJobIds(cid).length);
-      const reason = reasonOf(rec, timeout);
-      const since = (rec.replies[0]?.at ?? now()) - deliveredLookbackMs;
+      const open0 = openJobIds(cid);
+      const exhausted = rechecks >= totalRechecks;
+      const isLastCheck = timeout || (exhausted && !open0.length);
+      const dupStart = Math.min(rec.lastRunAt ?? Infinity, now() - DUP_WINDOW_MS);
+      rec.lastRunAt = now();
       let outcome = 'failed';
       let body = '';
       let dueAt;
       let sent = null;
+      let turned = false;
       try {
-        // Built now, after every wait, so the lists are current.
-        const delivered = (await readDelivered(cid, since)) || [];
-        const queued = [
-          ...outbox.filter((o) => o.conversationId === cid).map((o) => ({ at: o.at ?? now(), text: o.text })),
-          ...(missed[cid] || []).map((text) => ({ at: now(), text })),
-        ];
+        const horizon = getDelivered ? null : deliveredLog.horizon?.();
         const prompt = buildPrompt({
-          replies: rec.replies, delivered, queued, isLastCheck, userLabel, maxTextLength,
-          maxDelivered: maxDeliveredInPrompt, messageCount: counters[cid] || 0, now: now(), reason, dueAt: rec.dueAt,
+          replies: rec.replies,
+          delivered,
+          queued: outbox.filter((o) => o.conversationId === cid).map((o) => ({ at: o.at ?? now(), text: o.text })),
+          failed: (missed[cid] || []).map((m) => ({ at: m.at ?? now(), text: m.text })),
+          deliveredSince: horizon != null && rec.since < horizon ? horizon : undefined,
+          isLastCheck, userLabel, maxTextLength, maxDelivered: maxDeliveredInPrompt,
+          messageCount: counters[cid] || 0, now: now(), timeZone, reason, dueAt: rec.dueAt,
         });
         emit({ type: 'check_started', conversationId: cid, checkId: rec.id, replies: rec.replies.length, delivered: delivered.length, recheck: rechecks, isLastCheck, reason });
 
         let res;
         try {
+          turned = true;
           res = await callTurn(cid, prompt, { kind: 'check', checkId: rec.id, recheck: rechecks, isLastCheck, reason });
         } finally {
           free();
@@ -530,89 +785,115 @@ export function createNothingOwed(options = {}) {
         const text = typeof res === 'string' ? res : res?.text ?? '';
         usageOf(res, { conversationId: cid, checkId: rec.id });
 
-        ({ outcome, text: body, dueAt } = parse(text));
-        if (outcome === 'due' && !validDue(dueAt)) outcome = body ? 'deliver_running' : 'running';
+        let running;
+        ({ outcome, text: body, dueAt, running } = parse(text));
+        if (outcome === 'due' && !validDue(dueAt)) { outcome = body ? 'deliver_running' : 'running'; dueAt = undefined; }
+        if (outcome === 'due' && running) datedAt = dueAt; // both: the timer, and the running path below
         // On the last check there is nothing left to wait for.
         if (isLastCheck && outcome === 'deliver_running') outcome = 'deliver';
         const carries = outcome === 'deliver' || outcome === 'deliver_running' || outcome === 'due';
-        if (carries && body && isDuplicate(cid, body, delivered, since)) {
+        const mode = rec.kind === 'due' && reason === 'due' ? 'due' : 'check';
+        if (carries && body && isDuplicate(cid, body, { delivered, start: dupStart, mode })) {
           emit({ type: 'duplicate_skipped', conversationId: cid, checkId: rec.id, chars: body.length });
           body = '';
           if (outcome === 'deliver') outcome = 'nothing';
           if (outcome === 'deliver_running') outcome = 'running';
         }
         if (carries && body) {
-          sent = await deliverOwed(cid, body, { kind: 'check', checkId: rec.id, depth: rec.depth || 0 });
+          sent = await deliverOwed(cid, body, { kind: 'check', checkId: rec.id, depth: rec.depth || 0, dueDepth: rec.dueDepth || 0 });
           // A last-check status says the work is no longer watched: no verify after it.
           if (sent.ok && !isLastCheck) verifies.push([body, (rec.depth || 0) + 1]);
         }
-        if (outcome === 'due') datedAt = dueAt;
+        if (outcome === 'due') {
+          datedAt = dueAt;
+          if (running) outcome = sent?.ok ? 'deliver_running' : 'running';
+        }
       } catch (error) {
         outcome = 'failed';
         emit({ type: 'error', stage: 'check', conversationId: cid, checkId: rec.id, error });
       }
       free();
+      if (turned) {
+        if (outcome === 'failed') turnFailed();
+        else turnOk(cid);
+      }
 
-      // The last check ended without an answer for the user: code tells them plainly.
-      if (isLastCheck && (outcome === 'failed' || outcome === 'running')) {
-        await giveUp(cid, outcome === 'failed' ? 'failed' : 'still_running', { checkId: rec.id });
+      // The last step ended with no answer for the user: code writes the line, unless the
+      // circuit is open (then the step waits) or this conversation already got one this outage.
+      const lastFail = outcome === 'failed' && (exhausted || timeout);
+      const lastRunning = outcome === 'running' && isLastCheck;
+      if (lastFail && circuitOn() && circuit.pauseMs > 0 && !timeout) {
+        suppressed = true;
+      } else if (lastFail || lastRunning) {
+        const n = (notices[cid] ||= {});
+        if (lastFail && n.gaveUp) {
+          emit({ type: 'gave_up', conversationId: cid, reason: 'failed', checkId: rec.id, delivered: false, suppressed: true });
+        } else {
+          if (lastFail) n.gaveUp = true;
+          await sendLine(cid, lastFail ? 'failed' : 'still_running', { checkId: rec.id });
+        }
       }
 
       const ms = now() - t0;
       if (outcome === 'nothing') emit({ type: 'nothing_owed', conversationId: cid, checkId: rec.id, ms });
       else if (outcome === 'running') emit({ type: 'still_running', conversationId: cid, checkId: rec.id, recheck: rechecks + 1, ms });
       else if (outcome === 'failed') emit({ type: 'failed', conversationId: cid, checkId: rec.id, recheck: rechecks + 1, ms });
-      if (sent?.ok) emit({ type: 'delivered', conversationId: cid, checkId: rec.id, chars: body.length, ms, ids: sent.ids, stillRunning: outcome === 'deliver_running' });
+      if (sent?.ok) emit({ type: 'delivered', conversationId: cid, checkId: rec.id, chars: body.length, ms, ids: sent.ids, stillRunning: outcome === 'deliver_running' || outcome === 'running' });
       return await finish(outcome);
     } finally {
       free();
+      if (probe) probing = false;
     }
   }
 
   // ---- jobs and report turns --------------------------------------------------------------
 
+  // Mark the report delivered in the store before the send: a crash after the send never repeats it.
+  async function sendReport(rep, text, kind) {
+    rep.delivering = true;
+    await flushAll();
+    return deliverOwed(rep.conversationId, text, { kind, jobId: rep.job.id, depth: 0 });
+  }
+
   async function reportFallback(rep, reason) {
-    const text = fallbackReportText(rep.job);
-    const sent = await deliverOwed(rep.conversationId, text, { kind: 'fallback', jobId: rep.job.id });
+    const sent = await sendReport(rep, fallbackReportText(rep.job), 'fallback');
     emit({ type: 'report_fallback', conversationId: rep.conversationId, jobId: rep.job.id, reason, delivered: sent.ok });
   }
 
   async function reportDone(rep) {
     reports = reports.filter((x) => x !== rep);
     unparkFor(rep.job);
+    emit({ type: 'report_done', conversationId: rep.conversationId, jobId: rep.job.id });
     await save();
     arm();
     await api.tick();
     return 'report';
   }
 
-  async function runReport(rep) {
+  async function runReport(rep, { probe = false } = {}) {
     const cid = rep.conversationId;
     const job = rep.job;
-    await acquire();
-    let held = true;
+    let held = false;
     const free = () => { if (held) { held = false; release(); } };
     try {
-      if (isUserBusy) {
-        let busy = false;
-        try { busy = !!(await isUserBusy(cid)); } catch (error) { emit({ type: 'error', stage: 'isUserBusy', conversationId: cid, error }); }
-        if (busy) {
-          free();
-          rep.state = 'pending';
-          rep.due = now() + busyRetryMs;
-          emit({ type: 'yielded', conversationId: cid, checkId: null, jobId: job.id });
-          await save();
-          arm();
-          return 'busy';
-        }
+      const w = await waitForTurn(cid, rep).catch((error) => ({ error }));
+      if (w.busy || w.error) {
+        if (w.error) emit({ type: 'error', stage: 'isUserBusy', conversationId: cid, jobId: job.id, error: w.error });
+        rep.state = 'pending';
+        rep.due = now() + busyRetryMs;
+        emit({ type: 'yielded', conversationId: cid, checkId: null, jobId: job.id });
+        await save();
+        arm();
+        return 'busy';
       }
-      if (!spendTurn(cid)) {
+      held = true;
+      if (spendTurn(cid, 'report')) {
         free();
         emit({ type: 'daily_cap', conversationId: cid, checkId: null, jobId: job.id, until: nextDay() });
         await reportFallback(rep, 'capped');
         return await reportDone(rep);
       }
-      if (missed[cid]?.length) await sendMissed(cid);
+      if (missed[cid]?.length) await sendMissed(cid, true);
 
       let outcome = 'failed';
       let body = '';
@@ -633,12 +914,14 @@ export function createNothingOwed(options = {}) {
         emit({ type: 'error', stage: 'report', conversationId: cid, jobId: job.id, error });
       }
       free();
+      if (outcome === 'failed') turnFailed();
+      else turnOk(cid);
 
       if (outcome === 'failed') {
         rep.attempts = (rep.attempts || 0) + 1;
-        if (rep.attempts <= totalRechecks) {
+        if (rep.attempts <= totalRechecks || (circuitOn() && circuit.pauseMs > 0)) {
           rep.state = 'pending';
-          rep.due = now() + recheckDelay(rep.attempts - 1);
+          rep.due = Math.max(now() + recheckDelay(Math.min(rep.attempts - 1, totalRechecks - 1)), circuit.openUntil || 0);
           emit({ type: 'report_retry', conversationId: cid, jobId: job.id, attempt: rep.attempts, due: rep.due });
           await save();
           arm();
@@ -654,10 +937,10 @@ export function createNothingOwed(options = {}) {
       const carries = (outcome === 'deliver' || outcome === 'deliver_running' || outcome === 'due') && body;
       if (!carries) {
         await reportFallback(rep, outcome);
-      } else if (isDuplicate(cid, body, [], -Infinity)) {
+      } else if (isDuplicate(cid, body, { jobId: job.id, mode: 'report' })) {
         emit({ type: 'duplicate_skipped', conversationId: cid, checkId: null, jobId: job.id, chars: body.length });
       } else {
-        const sent = await deliverOwed(cid, body, { kind: 'report', jobId: job.id, depth: 0 });
+        const sent = await sendReport(rep, body, 'report');
         if (sent.ok) {
           emit({ type: 'report_delivered', conversationId: cid, jobId: job.id, chars: body.length, ids: sent.ids });
           scheduleVerify(cid, body, 1);
@@ -666,16 +949,18 @@ export function createNothingOwed(options = {}) {
       return await reportDone(rep);
     } finally {
       free();
+      if (probe) probing = false;
     }
   }
 
   const api = {
     /**
      * The agent sent `text` to the user in `conversationId`. Opens that conversation's check
-     * window if none is pending; otherwise joins it (the due time never moves). Kinds 'check' and
-     * 'report' (replies the host delivered itself) count and get one verify check; 'giveup',
-     * 'fallback' and 'missed' only count; 'system' does neither. A package delivery routed back
-     * here is recognized and ignored (it is already counted and verified).
+     * window if none is pending; otherwise joins it (the due time never moves, except a check
+     * waiting for tomorrow's cap, which comes back to now + delayMs). Kinds 'check' and 'report'
+     * (replies the host delivered itself) count and get one verify check; 'giveup', 'fallback'
+     * and 'missed' only count; 'system' does neither. A package delivery routed back here is
+     * recognized and ignored (it is already counted and verified).
      */
     noteReply(conversationId, text, { kind, at } = {}) {
       const cid = String(conversationId);
@@ -695,9 +980,11 @@ export function createNothingOwed(options = {}) {
       if (rec) {
         rec.replies = keepFirst([...rec.replies, reply]);
         if (rec.kind === 'verify') rec.kind = 'window'; // a new reply joined: it is a window check now
+        rec.fresh = true;
+        if (rec.capped && rec.due > t + delayMs) { rec.due = t + delayMs; delete rec.capped; }
         emit({ type: 'merged', conversationId: cid, checkId: rec.id, replies: rec.replies.length, due: rec.due });
       } else {
-        rec = { id: newId('chk', t), conversationId: cid, state: 'pending', kind: 'window', due: t + delayMs, replies: [reply], rechecks: 0, depth: 0 };
+        rec = { id: newId('chk', t), conversationId: cid, state: 'pending', kind: 'window', fresh: true, due: t + delayMs, replies: [reply], rechecks: 0, depth: 0 };
         records.push(rec);
         emit({ type: 'scheduled', conversationId: cid, checkId: rec.id, due: rec.due });
       }
@@ -718,22 +1005,33 @@ export function createNothingOwed(options = {}) {
       return counters[String(conversationId)] || 0;
     },
 
-    /** A message really reached the user (built-in delivered log). Ignored if you pass getDelivered. */
+    /** A message really reached the user (built-in delivered log). Never throws into your send path. */
     noteDelivered(conversationId, text, atOrOpts) {
       const opts = typeof atOrOpts === 'number' ? { at: atOrOpts } : atOrOpts || {};
-      return deliveredLog.note(conversationId, text, opts);
+      try {
+        touch(String(conversationId));
+        return deliveredLog.note(conversationId, text, opts);
+      } catch (error) {
+        emit({ type: 'error', stage: 'deliveredLog', conversationId: String(conversationId), error });
+        return { at: opts.at ?? now(), text: String(text ?? '') };
+      }
     },
 
     /**
      * "Missed:" notices for deliveries that were given up on, for the host to send before its
-     * next message in that conversation. Each is returned once.
+     * next message in that conversation. Each is returned once and its timer is cancelled.
      */
     flushMissed(conversationId) {
       const cid = String(conversationId);
       const list = missed[cid] || [];
       delete missed[cid];
-      if (list.length) void save();
-      return list.map((t) => `Missed: ${t}`);
+      if (list.length) { void save(); arm(); }
+      return list.map((m) => `Missed: ${m.text}`);
+    },
+
+    /** True while a model turn (check or report) runs for this conversation. */
+    isChecking(conversationId) {
+      return activeTurns.has(String(conversationId));
     },
 
     /** The host started long work for this conversation. A STILL_RUNNING check parks on it. */
@@ -741,15 +1039,17 @@ export function createNothingOwed(options = {}) {
       const id = String(jobId);
       const job = { id, conversationId: String(conversationId), title: title ?? id, startedAt: now() };
       jobs[id] = job;
+      touch(job.conversationId);
       emit({ type: 'job_tracked', conversationId: job.conversationId, jobId: id, title: job.title });
       void save();
       return { ...job };
     },
 
     /**
-     * Tracked work ended. Runs onJobFinished, or queues one report turn (it waits for a busy user,
-     * retries on failure and falls back to a code-written line), then any check parked on it.
-     * Resolves when that has run, or once it is waiting.
+     * Tracked work ended. Resolves at once with the finished job. In the background: onJobFinished,
+     * or one stored report turn (it waits for a busy user, retries on failure and falls back to a
+     * code-written line), then any check parked on it. Events say when: report_delivered,
+     * report_fallback, report_done.
      */
     finishJob(jobId, { status = 'done', text = '' } = {}) {
       const id = String(jobId);
@@ -759,18 +1059,20 @@ export function createNothingOwed(options = {}) {
       const job = { ...open, status, text: String(text ?? ''), finishedAt: now() };
       const cid = job.conversationId;
       emit({ type: 'job_finished', conversationId: cid, jobId: id, status });
-      return track((async () => {
-        if (typeof onJobFinished === 'function') {
-          try { await onJobFinished(cid, { ...job }); } catch (error) { emit({ type: 'error', stage: 'onJobFinished', conversationId: cid, jobId: id, error }); }
+      if (typeof onJobFinished === 'function') {
+        void track((async () => {
+          try { await timed('onJobFinished', () => onJobFinished(cid, { ...job })); } catch (error) { emit({ type: 'error', stage: 'onJobFinished', conversationId: cid, jobId: id, error }); }
           unparkFor(job);
-        } else {
-          reports.push({ id: newId('rep', now()), conversationId: cid, job, due: now(), attempts: 0, state: 'pending' });
-        }
-        await save();
-        arm();
-        await api.tick();
-        return { ...job };
-      })());
+          await save();
+          arm();
+          await api.tick();
+        })());
+      } else {
+        reports.push({ id: newId('rep', now()), conversationId: cid, job, due: now(), attempts: 0, state: 'pending' });
+        void save();
+        void track(api.tick());
+      }
+      return Promise.resolve({ ...job });
     },
 
     /** trackJob, await the work, finishJob with its result (or error message), return the result. */
@@ -792,23 +1094,38 @@ export function createNothingOwed(options = {}) {
     },
 
     /**
-     * Load persisted state and arm the timer. Checks and reports that were running at a stop run
-     * again. Jobs found in the store died with the old process: they finish as 'lost' unless
+     * Load persisted state and arm the timer. Notes made before start() are merged in. Checks and
+     * reports that were running at a stop run again; a report already marked delivered is done.
+     * Jobs found in the store died with the old process: they finish as 'lost' unless
      * onStartJobs(jobs) returns their ids.
      */
     async start() {
       if (started) return api;
+      store.lock?.();
       const raw = (await store.load()) || [];
       const state = Array.isArray(raw) ? { records: raw } : raw; // v0.1 stores held a plain array
-      for (const [k, v] of Object.entries(state.counters || {})) counters[k] = Math.max(counters[k] || 0, v);
+      for (const [k, v] of Object.entries(state.counters || {})) counters[k] = (counters[k] || 0) + v;
+      for (const [k, v] of Object.entries(state.lastActive || {})) lastActive[k] = Math.max(lastActive[k] || 0, v);
+      for (const k of Object.keys(counters)) lastActive[k] ??= now();
       const loadedJobs = [];
       for (const [k, v] of Object.entries(state.jobs || {})) if (!jobs[k]) { jobs[k] = v; loadedJobs.push(v); }
-      for (const [k, v] of Object.entries(state.missed || {})) missed[k] = [...(missed[k] || []), ...(Array.isArray(v) ? v : [v])];
+      for (const [k, v] of Object.entries(state.missed || {})) {
+        const list = (Array.isArray(v) ? v : [v]).map((m) => (typeof m === 'string' ? { text: m, at: now(), due: now(), wait: missedRetryMs } : m));
+        missed[k] = [...list, ...(missed[k] || [])];
+      }
       for (const [k, v] of Object.entries(state.turnsByDay || {})) if (!turnsByDay[k]) turnsByDay[k] = v;
+      for (const [k, v] of Object.entries(state.notices || {})) notices[k] = { ...v, ...(notices[k] || {}) };
+      if (state.globalTurns) globalTurns = state.globalTurns;
+      if (state.circuit) circuit = state.circuit;
       const seenOut = new Set(outbox.map((o) => o.id));
       for (const o of state.outbox || []) if (!seenOut.has(o.id)) outbox.push({ ...o, sending: undefined });
       const seenRep = new Set(reports.map((p) => p.id));
-      for (const p of state.reports || []) if (!seenRep.has(p.id)) reports.push({ ...p, state: 'pending' });
+      const doneReports = [];
+      for (const p of state.reports || []) {
+        if (seenRep.has(p.id)) continue;
+        if (p.delivering) { doneReports.push(p); continue; } // sent (or tried) before the stop: never again
+        reports.push({ ...p, state: 'pending' });
+      }
       const seen = new Set(records.map((r) => r.id));
       for (const r of state.records || []) {
         if (seen.has(r.id)) continue;
@@ -816,19 +1133,23 @@ export function createNothingOwed(options = {}) {
         if (r.state === 'parked') {
           const parkedOn = (r.parkedOn || []).filter((id) => jobs[id]);
           if (parkedOn.length || r.timedOut) { records.push({ ...r, parkedOn }); continue; }
-          // Its jobs ended while the process was down: run it now.
           records.push({ ...r, state: 'parked', parkedOn: [] });
           unpark(records[records.length - 1], null);
           continue;
         }
         const rec = { ...r, state: 'pending', rechecks: r.rechecks || 0 };
         const cur = find(rec.conversationId, 'pending');
-        if (cur) cur.replies = keepFirst([...rec.replies, ...cur.replies]);
-        else records.push(rec);
+        if (cur) {
+          cur.replies = keepFirst([...rec.replies, ...cur.replies]);
+          cur.due = Math.min(cur.due, rec.due);
+          cur.rechecks = Math.max(cur.rechecks || 0, rec.rechecks);
+        } else records.push(rec);
       }
+      loaded = true;
+      for (const p of doneReports) unparkFor(p.job);
       let keep = [];
       if (loadedJobs.length && typeof onStartJobs === 'function') {
-        try { keep = (await onStartJobs(loadedJobs.map((j) => ({ ...j })))) || []; } catch (error) { emit({ type: 'error', stage: 'onStartJobs', error }); }
+        try { keep = (await timed('onStartJobs', () => onStartJobs(loadedJobs.map((j) => ({ ...j }))))) || []; } catch (error) { emit({ type: 'error', stage: 'onStartJobs', error }); }
       }
       const keepIds = new Set([...keep].map(String));
       const lost = loadedJobs.filter((j) => !keepIds.has(j.id));
@@ -852,16 +1173,31 @@ export function createNothingOwed(options = {}) {
       return api;
     },
 
-    /** Stop the timer. Work already running finishes; the rest stays in the store. */
-    stop() {
+    /** Stop the timer and write the final state (sync when the store can). Work already running finishes. */
+    async stop() {
       started = false;
       if (timer != null) { clearTimer(timer); timer = null; }
+      if (loaded) {
+        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+        if (typeof store.saveSync === 'function') {
+          try { store.saveSync(snapshot()); } catch (error) { emit({ type: 'error', stage: 'store', error }); }
+        } else {
+          await flushAll();
+        }
+      }
+      try { deliveredLog.flush?.(); } catch (error) { emit({ type: 'error', stage: 'deliveredLog', error }); }
+      try { store.unlock?.(); } catch { /* ignore */ }
       emit({ type: 'stopped' });
     },
 
+    /** Write any debounced state change now. */
+    flush() {
+      return flushAll();
+    },
+
     /**
-     * Run every check, report and delivery retry that is due now: at most one model turn per
-     * conversation at a time (reports first). Resolves with the outcomes.
+     * Run every check, report, missed notice and delivery retry that is due now: at most one model
+     * turn per conversation at a time (reports first), none while the circuit is open.
      */
     async tick() {
       const t = now();
@@ -869,11 +1205,24 @@ export function createNothingOwed(options = {}) {
       for (const r of records) if (r.state === 'running') taken.add(r.conversationId);
       for (const p of reports) if (p.state === 'running') taken.add(p.conversationId);
       const runs = [];
+      const halfOpen = circuitOn() && circuit.pauseMs > 0;
+      const canRun = () => !modelBlocked() && !(halfOpen && runs.length);
       for (const p of reports.filter((x) => x.state === 'pending' && x.due <= t).sort(byDue)) {
         if (taken.has(p.conversationId)) continue;
+        if (circuitOn() && circuit.pauseMs > 0) {
+          // the model is out (circuit open or not yet closed again): the job's own output goes
+          // now, as the code-written report
+          taken.add(p.conversationId);
+          p.state = 'running';
+          runs.push(async () => { await reportFallback(p, 'circuit_open'); return reportDone(p); });
+          continue;
+        }
+        if (!canRun()) continue;
         taken.add(p.conversationId);
         p.state = 'running';
-        runs.push(() => runReport(p));
+        const probe = halfOpen;
+        if (probe) probing = true;
+        runs.push(() => runReport(p, { probe }));
       }
       const due = records.filter((r) => (r.state === 'pending' || r.state === 'parked' || r.state === 'dated') && r.due <= t).sort(byDue);
       for (const r of due) {
@@ -883,17 +1232,22 @@ export function createNothingOwed(options = {}) {
           emit({ type: 'park_ended', conversationId: r.conversationId, checkId: r.id, jobIds: r.parkedOn || [] });
           continue;
         }
+        if (!canRun()) continue;
         const from = r.state;
         taken.add(r.conversationId);
         r.state = 'running';
-        runs.push(() => runCheck(r, { timeout: from === 'parked', from }));
+        const probe = halfOpen;
+        if (probe) probing = true;
+        runs.push(() => runCheck(r, { timeout: from === 'parked', from, probe }));
       }
       const retries = outbox.filter((o) => !o.sending && o.due <= t);
-      if (!runs.length && !retries.length) { arm(); return []; }
+      const missedDue = Object.keys(missed).filter((cid) => !missedLocks.has(cid) && missed[cid]?.some((m) => m.due <= t));
+      if (!runs.length && !retries.length && !missedDue.length) { arm(); return []; }
       for (const o of retries) o.sending = true;
       await save();
       arm();
       for (const o of retries) void track(retryDelivery(o));
+      for (const cid of missedDue) void track(sendMissed(cid, false).then(() => arm()));
       return Promise.all(runs.map((fn) => track(fn())));
     },
 
@@ -930,6 +1284,16 @@ export function createNothingOwed(options = {}) {
     /** Copies of the deliveries waiting for a retry. */
     outbox() {
       return outbox.map(({ sending, ...o }) => ({ ...o }));
+    },
+
+    /** Copies of the owed "Missed:" notices: [{ conversationId, text, due }]. */
+    missed() {
+      return Object.entries(missed).flatMap(([cid, list]) => (list || []).map((m) => ({ conversationId: cid, text: m.text, due: m.due })));
+    },
+
+    /** The circuit breaker: { open, fails, until }. */
+    circuit() {
+      return { open: circuitOpen(), fails: circuit.fails, until: circuit.openUntil };
     },
 
     deliveredLog,

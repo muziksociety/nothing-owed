@@ -9,7 +9,7 @@ import { world, MIN } from './helpers.js';
 
 const C = 'chat-3';
 const FIVE = 5 * MIN;
-const GIVE_UP = 'I could not check on what I promised you earlier. Ask me again if it is still open.';
+const GIVE_UP = "I may have said I'd follow up on something, and I couldn't check it. Ask me if anything is still open.";
 const LADDER = [5, 10, 15, 20, 25, 30, 35, 50, 80, 140, 260];
 
 async function five(opts = {}, extra = {}) {
@@ -46,8 +46,8 @@ test('empty answers and canned failure texts requeue like a throw', async () => 
   }
 });
 
-test('failures walk the whole ladder, then the user gets the fixed give-up line', async () => {
-  const w = await five({ reply: boom });
+test('failures walk the whole ladder, then the user gets the fixed give-up line (circuit breaker off)', async () => {
+  const w = await five({ reply: boom }, { circuitFailures: 0 });
   const t0 = w.t;
   w.no.noteReply(C, 'x');
   await steps(w, 300);
@@ -130,17 +130,19 @@ test('the verify chain stops at maxVerifyDepth', async () => {
   const w = await five({ reply: () => `Part ${++n}, more soon.` });
   w.no.noteReply(C, 'x');
   await steps(w, 120);
-  assert.deepEqual(texts(w), ['Part 1, more soon.', 'Part 2, more soon.', 'Part 3, more soon.', 'Part 4, more soon.']);
+  const NO_LONGER = "I'm no longer watching this for you automatically. Ask me if anything is still open.";
+  assert.deepEqual(texts(w), ['Part 1, more soon.', 'Part 2, more soon.', 'Part 3, more soon.', 'Part 4, more soon.', NO_LONGER]);
   const w2 = await five({ reply: () => `Part ${++n}` }, { maxVerifyDepth: 1 });
   w2.no.noteReply(C, 'x');
   await steps(w2, 60);
-  assert.equal(w2.sent.length, 2);
+  assert.equal(w2.sent.length, 3);
 });
 
 test('a delivered job report gets a verify check too', async () => {
   const w = await five({ reply: (_c, _p, ctx) => (ctx.kind === 'report' ? 'Done. I will also send the logs later.' : 'NOTHING_OWED') });
   w.no.trackJob(C, 'j', { title: 'build' });
   await w.no.finishJob('j', { text: 'ok' });
+  await w.no.idle();
   assert.equal(w.no.pending()[0].kind, 'verify');
   await w.advance(FIVE);
   assert.equal(w.turns.at(-1).ctx.reason, 'verify');
@@ -249,8 +251,9 @@ test('jobs found in the store at start are lost: the normal finish path runs and
   w.no.trackJob(C, 'render-1', { title: 'render' });
   w.no.noteReply(C, 'Rendering, I will report when done.');
   await w.advance(FIVE);
+  await w.advance(FIVE); // the second STILL_RUNNING parks
   assert.equal(w.no.parked().length, 1);
-  w.no.stop();
+  await w.no.stop();
   w.timers = [];
   w.reply = (_c, p, ctx) => (ctx.kind === 'report' ? 'The render was interrupted by a restart. Ask me to start it again.' : 'NOTHING_OWED');
   w.no = w.make({ delayMs: FIVE });
@@ -325,6 +328,7 @@ test('the report turn waits while the user is busy', async () => {
   const w = await five({ reply: 'Report: done.' }, { isUserBusy: () => busy, busyRetryMs: MIN });
   w.no.trackJob(C, 'j', { title: 'build' });
   await w.no.finishJob('j', { text: 'ok' });
+  await w.no.idle();
   assert.equal(w.turns.length, 0);
   assert.equal(w.no.reports().length, 1);
   busy = false;
@@ -338,6 +342,7 @@ test('a failed report turn is retried, then a code-written fallback goes out', a
   const w = await five({ reply: boom }, { maxRechecks: 1, backoffMs: [] });
   w.no.trackJob(C, 'j1', { title: 'render' });
   await w.no.finishJob('j1', { status: 'done', text: 'RESULT: 42\nmore lines' });
+  await w.no.idle();
   assert.equal(w.sent.length, 0);
   await w.advance(FIVE);
   assert.equal(w.turns.length, 2);
@@ -351,6 +356,7 @@ test('a report that answers NOTHING_OWED or only STILL_RUNNING gets the fallback
     const w = await five({ reply });
     w.no.trackJob(C, 'j', { title: 'export' });
     await w.no.finishJob('j', { status: 'error', text: 'x'.repeat(400) });
+    await w.no.idle();
     assert.deepEqual(texts(w), [`export error: ${'x'.repeat(300)}`], reply);
   }
 });
@@ -362,6 +368,7 @@ test('a pending report survives a restart', async () => {
   await w.no.start();
   w.no.trackJob(C, 'j', { title: 'build' });
   await w.no.finishJob('j', { text: 'ok' });
+  await w.no.idle();
   w.no.stop();
   w.timers = [];
   w.no = w.make({ delayMs: FIVE });
@@ -387,7 +394,7 @@ test('a give-up keeps the full text; flushMissed hands it to the host once', asy
   down = false;
 });
 
-test('a give-up schedules a fresh check, which sends the Missed notice first', async () => {
+test('a give-up hands the text to the missed timer: the notice goes 15 minutes later, no model turn', async () => {
   let down = true;
   const w = world({ reply: 'Your summary: three points.' });
   w.no = w.make({ delayMs: FIVE, maxDeliveryAttempts: 2, deliver: async (cid, text) => { if (down) throw new Error('net'); w.sent.push({ conversationId: cid, text }); } });
@@ -395,11 +402,12 @@ test('a give-up schedules a fresh check, which sends the Missed notice first', a
   w.no.noteReply(C, 'summary coming');
   await w.advance(FIVE);
   await w.advance(FIVE); // attempt 2 fails: give-up
-  assert.equal(w.no.pending().length, 1, 'fresh check');
+  assert.equal(w.no.pending().length, 0);
+  assert.equal(w.no.missed().length, 1);
   down = false;
-  w.reply = (_c, p) => (p.includes('Your summary: three points.') ? 'NOTHING_OWED' : 'Your summary: three points.');
-  await w.advance(FIVE);
+  await w.advance(15 * MIN);
   assert.deepEqual(texts(w), ['Missed: Your summary: three points.']);
+  assert.equal(w.turns.length, 1);
 });
 
 // ---- 10. duplicates -------------------------------------------------------------------------
@@ -446,7 +454,7 @@ test('maxConcurrent caps model turns across conversations (default 2)', async ()
 });
 
 test('dailyCap: past the cap a conversation waits for the next day', async () => {
-  const w = await five({ reply: 'STILL_RUNNING' }, { dailyCap: 3 });
+  const w = await five({ reply: 'STILL_RUNNING' }, { dailyCap: 3, dailyCapReserve: 0 });
   w.no.noteReply(C, 'x');
   await steps(w, 30);
   assert.equal(w.turns.length, 3);
@@ -483,6 +491,7 @@ test('the built-in delivered log drops conversations idle longer than maxAgeMs',
   log.note('old-chat', 'hi');
   t = 500;
   log.note('new-chat', 'hello');
+  log.flush();
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(path, 'utf8'))), ['new-chat']);
 });
 

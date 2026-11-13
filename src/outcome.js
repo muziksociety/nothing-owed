@@ -17,6 +17,17 @@ export function clipText(s, max = 300) {
   return `${flat.slice(0, head)} … ${tail > 0 ? flat.slice(-tail) : ''}`;
 }
 
+// "Now: Friday 13 November 2026 at 05:00 (America/New_York), 2026-11-13T10:00:00.000Z", or the UTC time only.
+function nowLine(t, timeZone) {
+  if (timeZone) {
+    try {
+      const local = new Intl.DateTimeFormat('en-GB', { timeZone, dateStyle: 'full', timeStyle: 'short' }).format(new Date(t));
+      return `Now: ${local} (${timeZone}), ${iso(t)}.`;
+    } catch { /* unknown zone: UTC only */ }
+  }
+  return `Now (UTC): ${iso(t)}.`;
+}
+
 const back = (n) => (n === 1 ? '1 message back' : `${n} messages back`);
 const hasSeq = (items) => items.some((x) => x.seq != null);
 
@@ -46,6 +57,7 @@ const list = (items, max, messageCount) =>
  * @param {number}  [input.maxDelivered] show at most this many delivered messages, newest (default 40)
  * @param {number}  [input.messageCount] messages in the conversation so far (for "N messages back")
  * @param {number}  [input.now]          the time now, epoch ms (shown so the agent can write DUE times)
+ * @param {string}  [input.timeZone]     IANA zone of the user (e.g. 'America/New_York'): the time is shown in it too
  * @param {'window'|'recheck'|'verify'|'due'|'park_timeout'} [input.reason] why this check runs
  * @param {number}  [input.dueAt]        on a dated check: the time the agent set
  * @returns {string}
@@ -62,12 +74,13 @@ export function buildPrompt({
   maxDelivered = 40,
   messageCount = 0,
   now,
+  timeZone,
   reason,
   dueAt,
 }) {
   const u = userLabel;
   const lines = [`[Check from the system, not from ${u}.`];
-  if (now != null) lines.push(`The time now is ${iso(now)}.`);
+  if (now != null) lines.push(nowLine(now, timeZone));
   if (reason === 'due') {
     lines.push(`This check runs at the time you set${dueAt != null ? ` (${iso(dueAt)})` : ''} for something you promised ${u}. If it is owed now, deliver it now.`);
   }
@@ -91,7 +104,8 @@ export function buildPrompt({
     lines.push('Failed to send - write it again if still needed:', list(failed, maxTextLength, 0));
   }
   lines.push(
-    `Only what is in this delivered list reached ${u}. Anything you wrote that is not in it, they never saw.`,
+    `Only what is in this delivered list reached ${u}. Anything you wrote that is not in it, they never saw. Never say something was sent unless it is in this list.`,
+    `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. This turn cannot send files: if a file is owed, say in one line that it will be sent again and end with ${STILL_RUNNING}, or describe what it holds. Never pretend to attach anything.`,
     `If you promised ${u} anything that is not in the delivered list, deliver it now, in full.`,
     `Background work you said will report back on its own stays owed until its report is in the delivered list.`,
   );
@@ -104,7 +118,7 @@ export function buildPrompt({
     );
   }
   lines.push(
-    `If you promised something for a later time (a reminder, "I will check again at 9"), reply with the line DUE <ISO 8601 time>, for example DUE 2030-01-01T09:00:00Z, alone or as the last line after what you deliver now; the check comes back at that time.`,
+    `If you promised something for a later time (a reminder, "I will check again at 9"), reply with the line DUE <time in UTC, ISO 8601 ending in Z>, for example DUE 2030-01-01T09:00:00Z, alone or as the last line after what you deliver now; the check comes back at that time.`,
     `If you owe nothing, or all of it is in the delivered list, reply with exactly ${NOTHING_OWED}.`,
     `Do not wait in this turn: no sleeping, no polling loops, no watching files or processes.]`,
   );
@@ -197,7 +211,8 @@ const isNote = (body) => /^\(.*\)$/s.test(body.trim());
  *
  * @param {string} text
  * @param {{failTexts?: string[]}} [opts] canned failure notices your runtime returns instead of a reply
- * @returns {{outcome: 'nothing'|'running'|'deliver'|'deliver_running'|'due'|'failed', text: string, dueAt?: number}}
+ * @returns {{outcome: 'nothing'|'running'|'deliver'|'deliver_running'|'due'|'failed', text: string, dueAt?: number, running?: boolean}}
+ *   `running` is set with outcome 'due' when a STILL_RUNNING marker came too: set the timer AND keep watching
  */
 export function parseCheckReply(text, { failTexts = [] } = {}) {
   const raw = String(text ?? '').trim();
@@ -207,29 +222,28 @@ export function parseCheckReply(text, { failTexts = [] } = {}) {
   let lines = trimBlank(s.split('\n'));
 
   let dueAt = null;
+  let dueBad = false;
   let running = false;
-  const lastDue = dueLine(lines[lines.length - 1]);
-  const firstDue = !lastDue && lines.length > 1 ? dueLine(lines[0]) : null;
-  if (lastDue) lines = lines.slice(0, -1);
-  else if (firstDue) lines = lines.slice(1);
-  const due = lastDue || firstDue;
-  if (due?.at != null) dueAt = due.at;
-  else if (due?.invalid) running = true;
-  lines = trimBlank(lines);
+  let nothingFirst = false;
+  let nothingLast = false;
+  // Take marker lines off the end (up to the last two), then off the start.
+  const take = (line, end) => {
+    const due = dueLine(line);
+    if (due) { if (due.at != null && dueAt == null) dueAt = due.at; else if (due.at == null) dueBad = true; return true; }
+    const d = decor(line);
+    if (RUNNING_LINE.test(d)) { running = true; return true; }
+    if (NOTHING_LINE.test(d)) { if (end) nothingLast = true; else nothingFirst = true; return true; }
+    return false;
+  };
+  for (let i = 0; i < 2 && lines.length; i++) {
+    if (!take(lines[lines.length - 1], true)) break;
+    lines = trimBlank(lines.slice(0, -1));
+  }
+  if (lines.length && take(lines[0], false)) lines = trimBlank(lines.slice(1));
+  if (dueBad && dueAt == null) running = true;
 
-  const first = lines.length ? decor(lines[0]) : '';
-  const last = lines.length ? decor(lines[lines.length - 1]) : '';
-  const nothingFirst = lines.length > 0 && NOTHING_LINE.test(first);
-  const nothingLast = lines.length > 0 && NOTHING_LINE.test(last);
-  const runningFirst = lines.length > 0 && RUNNING_LINE.test(first);
-  const runningLast = lines.length > 0 && RUNNING_LINE.test(last);
-
-  if ((nothingFirst || nothingLast) && (runningFirst || runningLast)) return { outcome: 'running', text: '' };
-  if (nothingLast && dueAt == null && !running) return { outcome: 'nothing', text: '' };
-  if (nothingFirst) lines = trimBlank(lines.slice(1));
-  else if (nothingLast) lines = trimBlank(lines.slice(0, -1));
-  if (runningLast) { lines = trimBlank(lines.slice(0, -1)); running = true; }
-  else if (runningFirst) { lines = trimBlank(lines.slice(1)); running = true; }
+  if ((nothingFirst || nothingLast) && running) return dueAt != null ? { outcome: 'due', text: '', dueAt, running: true } : { outcome: 'running', text: '' };
+  if (nothingLast && dueAt == null) return { outcome: 'nothing', text: '' };
 
   let body = lines.join('\n').trim();
   const leading = LEADING_NOTHING.test(body);
@@ -245,9 +259,18 @@ export function parseCheckReply(text, { failTexts = [] } = {}) {
   }
   if ((dueAt != null || running) && isNote(body)) body = '';
 
-  if (dueAt != null) return { outcome: 'due', text: body, dueAt };
+  if (dueAt != null) return running ? { outcome: 'due', text: body, dueAt, running: true } : { outcome: 'due', text: body, dueAt };
   if (running) return body ? { outcome: 'deliver_running', text: body } : { outcome: 'running', text: '' };
   return body ? { outcome: 'deliver', text: body } : { outcome: 'nothing', text: '' };
+}
+
+/**
+ * True for a reply that is tool-call markup returned as text (it must never reach the user): a
+ * line starting with "<｜", or "invoke name=", "<tool_call", "<function_calls>" anywhere.
+ */
+export function isJunkReply(text) {
+  const s = String(text ?? '');
+  return /^\s*<｜/m.test(s) || /invoke name=/i.test(s) || /<tool_call/i.test(s) || /<function_calls>/i.test(s);
 }
 
 /**
