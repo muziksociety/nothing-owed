@@ -294,7 +294,7 @@ Also exported: `buildPrompt()`, `buildReportPrompt()`, `parseOutcome()`, `parseC
 
 ## Results
 
-**Small replay: 9 past conversations, one model, v0.1 prompt.** A later replay of the v0.3 prompt on 54 cases scored 49/54 with Claude and 41/54 with DeepSeek; the misses it found (marker combinations, tool-call markup sent as text, time zones, claims about files) are handled in v0.4's parser and prompt. **The v0.4 prompt has not been replayed on a real model yet.** Everything v0.4 adds on the code side is covered by tests on a fake clock with a fake model; whether a given model follows the new prompt lines is not measured.
+**Small replay: 9 past conversations, one model, v0.1 prompt.** A later replay of the v0.3 prompt on 18 cases, 3 runs each, scored 49/54 runs correct with Claude and 41/54 with DeepSeek; the misses it found (marker combinations, tool-call markup sent as text, time zones, claims about files) are handled in v0.4's parser and prompt. **The v0.4 prompt has not been replayed on a real model yet.** Everything v0.4 adds on the code side is covered by tests on a fake clock with a fake model; whether a given model follows the new prompt lines is not measured.
 
 | Test (v0.1 prompt, offline replay, tools sealed off) | Result |
 |---|---|
