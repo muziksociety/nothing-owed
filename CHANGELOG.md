@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] - 2026-11-13
+
+### Fixed
+
+- A short status sentence before a `DUE` line ("Nothing new owed tonight; the reminder comes in the morning.") is no longer sent to the user. Seen with DeepSeek in the replay. Replies over 400 characters or with a link are still sent.
+- The prompt says text before `DUE` is sent, and asks for no status note.
+
+### Docs
+
+- README Results: DeepSeek replay of the v0.4.1 prompt.
+
 ## [0.4.1] - 2026-11-13
 
 From a review of normal day-to-day flows.

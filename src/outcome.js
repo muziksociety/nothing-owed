@@ -118,7 +118,7 @@ export function buildPrompt({
     );
   }
   lines.push(
-    `If you promised something for a later time (a reminder, "I will check again at 9"), reply with the line DUE <time in UTC, ISO 8601 ending in Z>, for example DUE 2030-01-01T09:00:00Z, alone or as the last line after what you deliver now; the check comes back at that time.`,
+    `If you promised something for a later time (a reminder, "I will check again at 9"), reply with the line DUE <time in UTC, ISO 8601 ending in Z>, for example DUE 2030-01-01T09:00:00Z, alone or as the last line after what you deliver now; the check comes back at that time. Text before it is sent to ${u}, so do not add a status note about the timer.`,
     `If you owe nothing, or all of it is in the delivered list, reply with exactly ${NOTHING_OWED}.`,
     `Do not wait in this turn: no sleeping, no polling loops, no watching files or processes.]`,
   );
@@ -203,6 +203,8 @@ function trimBlank(lines) {
 const lastSentence = (s) => s.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean).pop() || '';
 const capitalize = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 const isNote = (body) => /^\(.*\)$/s.test(body.trim());
+const DUE_STATUS = /^(?:nothing\s+(?:(?:new|else|more|further)\s+)?(?:is\s+)?owed|i\s+owe\s+nothing)\b/i;
+const isDueStatus = (body) => body.length <= 400 && !/https?:\/\/|www\./i.test(body) && DUE_STATUS.test(body.trim());
 const isRemark = (body) =>
   body.length < 160 && !body.includes('\n') && !/\b(?:except|but|however)\b/i.test(body) &&
   !/https?:\/\/|www\./i.test(body) && body.split(/(?<=[.!?])\s+/).filter(Boolean).length <= 1;
@@ -276,6 +278,9 @@ export function parseCheckReply(text, { failTexts = [] } = {}) {
     running = true;
   }
   if ((dueAt != null || running) && isNote(body)) body = '';
+  // "Nothing new owed tonight; the reminder comes in the morning." before a DUE line is a status
+  // note about the timer, not something for the user. Long replies or links stay content.
+  if (dueAt != null && isDueStatus(body)) body = '';
 
   if (dueAt != null) return running ? { outcome: 'due', text: body, dueAt, running: true } : { outcome: 'due', text: body, dueAt };
   if (running) return body ? { outcome: 'deliver_running', text: body } : { outcome: 'running', text: '' };
