@@ -449,11 +449,21 @@ export function createNothingOwed(options = {}) {
       ownDrop(cid, e);
       throw error;
     }
+    const r = res && typeof res === 'object' ? res : {};
+    if (r.skipped === true) {
+      // the host chose not to send it: nothing reached the user, nothing to log or verify
+      ownDrop(cid, e);
+      emit({ type: 'delivery_skipped', conversationId: cid, kind: meta.kind, checkId: meta.checkId ?? null, jobId: meta.jobId ?? null });
+      return { skipped: true, text: '' };
+    }
+    // the host may have changed the text on the way out (a guard rewrite): log what was really sent
+    const sentText = typeof r.text === 'string' && r.text.trim() ? r.text : text;
+    e.text = sentText;
     e.done = true;
     e.at = now();
     count(cid);
-    try { deliveredLog.note(cid, text); } catch (error) { emit({ type: 'error', stage: 'deliveredLog', conversationId: cid, error }); }
-    return { ids: res && typeof res === 'object' && Array.isArray(res.ids) ? res.ids : undefined };
+    try { deliveredLog.note(cid, sentText); } catch (error) { emit({ type: 'error', stage: 'deliveredLog', conversationId: cid, error }); }
+    return { ids: Array.isArray(r.ids) ? r.ids : undefined, text: sentText };
   };
 
   // Send the owed "Missed:" notices of one conversation, one sender at a time. `force` ignores
@@ -514,8 +524,8 @@ export function createNothingOwed(options = {}) {
   // retry; it never reaches runTurn again. A deliver() that hangs times out into the outbox.
   const deliverOwed = async (cid, text, meta) => {
     try {
-      const { ids } = await sendWithMissed(cid, text, meta);
-      return { ok: true, ids };
+      const { ids, text: sentText, skipped } = await sendWithMissed(cid, text, meta);
+      return { ok: true, ids, text: sentText, skipped: !!skipped };
     } catch (error) {
       const item = { id: newId('out', now()), conversationId: cid, text, attempts: 1, due: 0, at: now(), ...meta };
       failDelivery(item, error);
@@ -527,10 +537,10 @@ export function createNothingOwed(options = {}) {
     item.sending = true;
     item.attempts += 1;
     try {
-      const { ids } = await sendWithMissed(item.conversationId, item.text, item);
+      const { ids, text: sentText, skipped } = await sendWithMissed(item.conversationId, item.text, item);
       outbox = outbox.filter((o) => o !== item);
       emit({ type: 'delivery_recovered', ...outboxIds(item), attempt: item.attempts, ids });
-      if (VERIFY_KINDS.has(item.kind)) scheduleVerify(item.conversationId, item.text, (item.depth || 0) + 1, undefined, item.dueDepth);
+      if (!skipped && VERIFY_KINDS.has(item.kind)) scheduleVerify(item.conversationId, sentText, (item.depth || 0) + 1, undefined, item.dueDepth);
     } catch (error) {
       failDelivery(item, error);
     } finally {
@@ -821,7 +831,7 @@ export function createNothingOwed(options = {}) {
           sent = await deliverOwed(cid, body, { kind: 'check', checkId: rec.id, depth: rec.depth || 0, dueDepth: rec.dueDepth || 0 });
           // No verify after a last-check status (it says the work is no longer watched), nor after
           // a delivery that also set a DUE timer (the timer is the follow-up).
-          if (sent.ok && !isLastCheck && outcome !== 'due') verifies.push([body, (rec.depth || 0) + 1]);
+          if (sent.ok && !sent.skipped && !isLastCheck && outcome !== 'due') verifies.push([sent.text, (rec.depth || 0) + 1]);
         }
         if (outcome === 'due') {
           datedAt = dueAt;
@@ -964,9 +974,9 @@ export function createNothingOwed(options = {}) {
         emit({ type: 'duplicate_skipped', conversationId: cid, checkId: null, jobId: job.id, chars: body.length });
       } else {
         const sent = await sendReport(rep, body, 'report');
-        if (sent.ok) {
-          emit({ type: 'report_delivered', conversationId: cid, jobId: job.id, chars: body.length, ids: sent.ids });
-          scheduleVerify(cid, body, 1);
+        if (sent.ok && !sent.skipped) {
+          emit({ type: 'report_delivered', conversationId: cid, jobId: job.id, chars: sent.text.length, ids: sent.ids });
+          scheduleVerify(cid, sent.text, 1);
         }
       }
       return await reportDone(rep);

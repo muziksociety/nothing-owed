@@ -245,7 +245,7 @@ const output = await owed.wrapJob(conversationId, jobId, renderVideo(), { title:
 
 ## Delivery retry and missed notices
 
-`deliver()` counts as done only when it resolves. **Throw when the platform did not confirm the send** (for example, no message id came back). You may return `{ ids }`; they go into the `delivered` event. A `deliver()` that does not settle within `callbackTimeoutMs` counts as failed and goes to the outbox; if it later succeeds after all, the user can get that text twice.
+`deliver()` counts as done only when it resolves. **Throw when the platform did not confirm the send** (for example, no message id came back). You may return `{ ids }`; they go into the `delivered` event. If your send path changes the text on the way out (a guard rewrite), return `{ text }` with what was really sent: the delivered log and the verify check use it. If it decides not to send at all, return `{ skipped: true }`: nothing is logged as delivered, there is no verify and no retry, and a `delivery_skipped` event fires. A `deliver()` that does not settle within `callbackTimeoutMs` counts as failed and goes to the outbox; if it later succeeds after all, the user can get that text twice.
 
 A failed delivery is kept in the store and resent every `retryMs` (5 minutes), up to `maxDeliveryAttempts` (12). Retries resend the text already written; they never call `runTurn` again. Checks that run meanwhile see it in the prompt's queued list, and a word-for-word copy is not sent twice. An error with `retryAfterMs` sets the wait for that attempt; `isPermanentError(err)` returning true stops at once.
 

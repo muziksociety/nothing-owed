@@ -251,6 +251,7 @@ export type NothingOwedEvent =
   | { type: 'report_retry'; at: number; conversationId: string; jobId: string; attempt: number; due: number }
   | { type: 'report_fallback'; at: number; conversationId: string; jobId: string; reason: 'failed' | 'nothing' | 'running' | 'capped' | string; delivered: boolean }
   | { type: 'delivery_retry'; at: number; conversationId: string; kind: DeliveryKind; checkId?: string; jobId?: string; attempt: number; retryInMs: number; error: unknown }
+  | { type: 'delivery_skipped'; at: number; conversationId: string; kind: DeliveryKind; checkId: string | null; jobId: string | null }
   | { type: 'delivery_recovered'; at: number; conversationId: string; kind: DeliveryKind; checkId?: string; jobId?: string; attempt: number; ids?: Ids }
   | { type: 'delivery_failed'; at: number; conversationId: string; kind: DeliveryKind; checkId?: string; jobId?: string; attempts: number; permanent: boolean; error: unknown }
   | { type: 'missed_notice'; at: number; conversationId: string }
@@ -403,7 +404,8 @@ export interface NothingOwedOptions {
    * retryAfterMs sets the wait before the next attempt. The package counts it and logs it in the
    * built-in delivered log itself.
    */
-  deliver(conversationId: string, text: string, meta: DeliveryMeta): unknown | Promise<unknown>;
+  /** Send a package-made text. Throw if not confirmed. Return { text } when the host changed the text on the way out (it is logged instead), or { skipped: true } when the host chose not to send it (nothing logged, no verify, no retry). */
+  deliver(conversationId: string, text: string, meta: DeliveryMeta): void | { ids?: Ids; text?: string; skipped?: boolean } | Promise<void | { ids?: Ids; text?: string; skipped?: boolean }>;
   /** Return true for an error that will never succeed; retrying stops at once. */
   isPermanentError?(error: unknown): boolean;
   /** Return true for a reply that must never reach the user (failed check). Default: tool-call markup (isJunkReply). */
