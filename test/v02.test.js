@@ -214,7 +214,7 @@ test('finishJob runs one report turn, delivers it, then the parked check runs on
   assert.match(report.prompt, /done/);
   assert.ok(!report.prompt.includes('x'.repeat(751)), 'job text bounded to 1500: head and tail');
   assert.ok(report.prompt.includes('x'.repeat(750) + ' … ' + 'x'.repeat(750)));
-  assert.ok(report.prompt.includes('Tell the user in a few lines what it produced and what is still open. No waiting in this turn.'));
+  assert.ok(report.prompt.includes('Otherwise tell the user in a few lines what it produced and what is still open. No waiting in this turn.'));
   assert.equal(w.turns[3].ctx.kind, 'check');
   assert.deepEqual(w.sent.map((s) => s.text), ['The render is done: 3 files.']);
   assert.equal(w.no.parked().length, 0);

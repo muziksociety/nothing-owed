@@ -132,16 +132,21 @@ export function buildPrompt({
  * @param {{id:string, title?:string, status?:string, text?:string}} input.job
  * @param {string} [input.userLabel]
  * @param {number} [input.maxTextLength] bound the job's output to this many characters (default 1500)
+ * @param {{at:number,text:string}[]} [input.delivered] what reached the user since the job ended
  * @returns {string}
  */
-export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500 }) {
+export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40 }) {
   const u = userLabel;
+  const shown = delivered.slice(-Math.max(1, maxDelivered));
   return [
     `[Report from the system, not from ${u}.`,
     `The background job "${job.title || job.id}" you started for ${u} has ended. Status: ${job.status || 'done'}.`,
     `What it returned:`,
     job.text ? clipText(job.text, maxTextLength) : '(no output)',
-    `Tell ${u} in a few lines what it produced and what is still open. No waiting in this turn.]`,
+    `Messages the host delivered to ${u} since the job ended:`,
+    list(shown, 300, 0),
+    `If those messages already give ${u} what it produced, reply with exactly ${NOTHING_OWED}.`,
+    `Otherwise tell ${u} in a few lines what it produced and what is still open. No waiting in this turn.]`,
   ].join('\n');
 }
 
@@ -149,16 +154,18 @@ export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength =
 
 // Strip decoration a model puts around a marker: quotes, bold, code, a quote mark, list bullets,
 // trailing punctuation.
+// Strip decoration a model puts around a marker: quotes, bold, code, brackets, emoji, a quote mark,
+// list bullets, trailing punctuation.
 const decor = (line) =>
   String(line)
     .trim()
     .replace(/^(?:[>#\-*+]\s+)+/, '')
-    .replace(/^[`*_"'“”‘’\s]+/, '')
-    .replace(/[`*_"'“”‘’.!?,;:\s]+$/, '');
+    .replace(/^[`*_"'“”‘’\s[({\p{Extended_Pictographic}\uFE0F\u200D]+/u, '')
+    .replace(/[`*_"'“”‘’.!?,;:\s\])}\p{Extended_Pictographic}\uFE0F\u200D]+$/u, '');
 
 // A marker line: the marker alone, an optional label before it ("Status:"), an optional short note
 // after it ("(render)", "- all delivered").
-const markerRe = (word) => new RegExp(`^(?:(?:status|answer|result|outcome)\\s*:\\s*)?${word}\\s*(?:\\(.*\\)|\\[.*\\]|[-–—:].*)?$`, 'i');
+const markerRe = (word) => new RegExp(`^(?:(?:status|answer|result|outcome|reply)\\s*:\\s*)?${word}\\s*(?:[([].*|[-–—:].*)?$`, 'i');
 const NOTHING_LINE = markerRe('nothing[\\s_-]*owed');
 const RUNNING_LINE = markerRe('still[\\s_-]*running');
 const NOTHING_TOKEN = /nothing_owed/i;
@@ -168,14 +175,20 @@ const RUNNING_TOKEN = /\bSTILL_RUNNING\b/gi;
 const HAS_RUNNING_TOKEN = /\bSTILL_RUNNING\b/i;
 const ISO_ZONED = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
 
-// A DUE line (upper-case DUE only, so "Due 12 May..." stays content). { at } for an ISO time with a
-// zone, optionally in <...> and followed by a short note; { invalid: true } for any other DUE line.
+// A DUE line (upper-case DUE only, so "Due 12 May..." stays content). { at } for a date and time
+// (T or a space between them; no zone, Z, UTC or GMT read as UTC; an offset is kept), optionally in
+// <...> and followed by a short note; { invalid: true } for any other DUE line.
 function dueLine(line) {
   const d = decor(line);
   const m = d.match(/^DUE\b[\s:]*(.*)$/);
   if (!m) return null;
-  const t = m[1].match(/^<?\s*([^\s<>]+)\s*>?\s*(.*)$/);
-  if (t && ISO_ZONED.test(t[1]) && (!t[2] || /^[-–—:(,;[]/.test(t[2]))) return { at: Date.parse(t[1]) };
+  const t = m[1].match(/^<?\s*(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(Z|[+-]\d{2}:?\d{2}|UTC|GMT)?\s*>?\s*(.*)$/i);
+  if (t && (!t[4] || /^[-–—:(,;[]/.test(t[4]))) {
+    // the prompt asks for UTC: no zone, "Z", "UTC" or "GMT" all mean UTC; an explicit offset is kept
+    const zone = !t[3] || /^(z|utc|gmt)$/i.test(t[3]) ? 'Z' : t[3];
+    const at = Date.parse(`${t[1]}T${t[2]}${zone}`);
+    if (Number.isFinite(at)) return { at };
+  }
   return { invalid: true };
 }
 
@@ -190,6 +203,9 @@ function trimBlank(lines) {
 const lastSentence = (s) => s.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean).pop() || '';
 const capitalize = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 const isNote = (body) => /^\(.*\)$/s.test(body.trim());
+const isRemark = (body) =>
+  body.length < 160 && !body.includes('\n') && !/\b(?:except|but|however)\b/i.test(body) &&
+  !/https?:\/\/|www\./i.test(body) && body.split(/(?<=[.!?])\s+/).filter(Boolean).length <= 1;
 
 /**
  * Classify the check turn's reply and return the text to deliver. Strict about what it sends,
@@ -246,6 +262,8 @@ export function parseCheckReply(text, { failTexts = [] } = {}) {
   if (nothingLast && dueAt == null) return { outcome: 'nothing', text: '' };
 
   let body = lines.join('\n').trim();
+  // "NOTHING_OWED" then one short remark ("Everything is in the delivered list.") is still nothing
+  if (nothingFirst && !running && dueAt == null && isRemark(body)) return { outcome: 'nothing', text: '' };
   const leading = LEADING_NOTHING.test(body);
   if (body && !leading && !nothingFirst && dueAt == null && !running) {
     const end = lastSentence(body);

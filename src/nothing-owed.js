@@ -50,7 +50,13 @@ export function defaultGiveUpText({ reason, until } = {}) {
 
 /** The code-written report for a job whose report turn failed or declined: "<title> <status>: <first line>". */
 export function fallbackReportText(job) {
-  const line = String(job?.text ?? '').split(/\r?\n/).map((s) => s.trim()).find(Boolean) || '';
+  let source = job?.summary ?? job?.text ?? '';
+  const raw = String(source).trim();
+  if (job?.summary == null && /^[[{]/.test(raw)) {
+    // a JSON result: its text or summary, never the raw JSON
+    try { const v = JSON.parse(raw); source = typeof v?.text === 'string' ? v.text : typeof v?.summary === 'string' ? v.summary : ''; } catch { /* plain text */ }
+  }
+  const line = String(source).split(/\r?\n/).map((s) => s.trim()).find(Boolean) || '';
   const head = `${job?.title || job?.id} ${job?.status || 'done'}`;
   return line ? `${head}: ${line.slice(0, 300)}` : `${head}.`;
 }
@@ -126,6 +132,11 @@ export function createNothingOwed(options = {}) {
   // Timed rechecks: maxRechecks at delayMs, then one per back-off step. The last one asks for a status.
   const totalRechecks = maxRechecks + backoffMs.length;
   const recheckDelay = (done) => (done < maxRechecks ? delayMs : backoffMs[done - maxRechecks]);
+  // timeZone: an IANA zone, or a function of the conversation that returns one
+  const zoneOf = (cid) => {
+    if (typeof timeZone !== 'function') return timeZone;
+    try { return timeZone(cid) || undefined; } catch { return undefined; }
+  };
 
   const deliveredLog = options.deliveredLog || createDeliveredLog({ now, backing: store.deliveredBacking });
   const readDelivered = getDelivered || ((id, since) => deliveredLog.since(id, since));
@@ -143,6 +154,7 @@ export function createNothingOwed(options = {}) {
   let notices = {}; // conversationId -> { capDay, gaveUp }
   let circuit = { fails: 0, openUntil: 0, pauseMs: 0 };
   let lastActive = {}; // conversationId -> last activity time
+  const lastHostReply = {}; // conversationId -> time of the last normal reply the host noted
   let timer = null;
   let started = false;
   let loaded = false;
@@ -777,7 +789,7 @@ export function createNothingOwed(options = {}) {
           failed: (missed[cid] || []).map((m) => ({ at: m.at ?? now(), text: m.text })),
           deliveredSince: horizon != null && rec.since < horizon ? horizon : undefined,
           isLastCheck, userLabel, maxTextLength, maxDelivered: maxDeliveredInPrompt,
-          messageCount: counters[cid] || 0, now: now(), timeZone, reason, dueAt: rec.dueAt,
+          messageCount: counters[cid] || 0, now: now(), timeZone: zoneOf(cid), reason, dueAt: rec.dueAt,
         });
         emit({ type: 'check_started', conversationId: cid, checkId: rec.id, replies: rec.replies.length, delivered: delivered.length, recheck: rechecks, isLastCheck, reason });
 
@@ -880,6 +892,7 @@ export function createNothingOwed(options = {}) {
   async function runReport(rep, { probe = false } = {}) {
     const cid = rep.conversationId;
     const job = rep.job;
+    rep.since = job.finishedAt ?? now(); // the report prompt lists what reached the user since the job ended
     let held = false;
     const free = () => { if (held) { held = false; release(); } };
     try {
@@ -906,7 +919,7 @@ export function createNothingOwed(options = {}) {
       let body = '';
       let dueAt;
       try {
-        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength });
+        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt });
         let res;
         try {
           res = await callTurn(cid, prompt, { kind: 'report', jobId: job.id, checkId: null, recheck: rep.attempts || 0, isLastCheck: false, reason: 'report' });
@@ -942,7 +955,10 @@ export function createNothingOwed(options = {}) {
         addDated({ conversationId: cid, replies: [{ at: now(), text: clipText(body || fallbackReportText(job), maxTextLength), seq: counters[cid] }], depth: 0 }, dueAt);
       }
       const carries = (outcome === 'deliver' || outcome === 'deliver_running' || outcome === 'due') && body;
-      if (!carries) {
+      if (!carries && outcome === 'nothing' && (lastHostReply[cid] ?? -Infinity) >= (job.finishedAt ?? Infinity)) {
+        // the host answered after the job ended (for example with the result) and the model agrees
+        emit({ type: 'report_skipped', conversationId: cid, jobId: job.id, reason: 'host_replied' });
+      } else if (!carries) {
         await reportFallback(rep, outcome);
       } else if (isDuplicate(cid, body, { jobId: job.id, mode: 'report' })) {
         emit({ type: 'duplicate_skipped', conversationId: cid, checkId: null, jobId: job.id, chars: body.length });
@@ -982,11 +998,13 @@ export function createNothingOwed(options = {}) {
         return rec ? recCopy(rec) : null;
       }
       const t = at ?? now();
+      lastHostReply[cid] = t;
       const reply = { at: t, text: clipText(text, maxTextLength), seq: counters[cid] };
       let rec = find(cid, 'pending');
       if (rec) {
         rec.replies = keepFirst([...rec.replies, reply]);
         if (rec.kind === 'verify') rec.kind = 'window'; // a new reply joined: it is a window check now
+        rec.depth = 0; // a normal reply starts a new chain: verify depth counts package replies only
         rec.fresh = true;
         if (rec.capped && rec.due > t + delayMs) { rec.due = t + delayMs; delete rec.capped; }
         emit({ type: 'merged', conversationId: cid, checkId: rec.id, replies: rec.replies.length, due: rec.due });
@@ -1058,12 +1076,12 @@ export function createNothingOwed(options = {}) {
      * code-written line), then any check parked on it. Events say when: report_delivered,
      * report_fallback, report_done.
      */
-    finishJob(jobId, { status = 'done', text = '' } = {}) {
+    finishJob(jobId, { status = 'done', text = '', summary } = {}) {
       const id = String(jobId);
       const open = jobs[id];
       if (!open) return Promise.resolve(null);
       delete jobs[id];
-      const job = { ...open, status, text: String(text ?? ''), finishedAt: now() };
+      const job = { ...open, status, text: String(text ?? ''), ...(summary != null ? { summary: String(summary) } : {}), finishedAt: now() };
       const cid = job.conversationId;
       emit({ type: 'job_finished', conversationId: cid, jobId: id, status });
       if (typeof onJobFinished === 'function') {
@@ -1096,7 +1114,9 @@ export function createNothingOwed(options = {}) {
       if (typeof result === 'string') text = result;
       else if (typeof result?.text === 'string') text = result.text;
       else if (result != null) { try { text = JSON.stringify(result); } catch { text = String(result); } }
-      await api.finishJob(jobId, { status: 'done', text });
+      // the code-written fallback never shows raw JSON: the result's text or summary, else nothing
+      const summary = typeof result === 'string' ? result : typeof result?.text === 'string' ? result.text : typeof result?.summary === 'string' ? result.summary : '';
+      await api.finishJob(jobId, { status: 'done', text, summary });
       return result;
     },
 

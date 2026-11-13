@@ -13,7 +13,7 @@ const rows = [
   ['```\nDUE 2026-11-20T09:00:00Z\n```', { outcome: 'due', text: '', dueAt: Z }],
   ['DUE <2026-11-20T09:00:00Z>', { outcome: 'due', text: '', dueAt: Z }],
   ['DUE tomorrow at 9:00', { outcome: 'running', text: '' }],
-  ['DUE 2026-11-20 09:00', { outcome: 'running', text: '' }],
+  ['DUE 2026-11-20 09:00', { outcome: 'due', text: '', dueAt: Z }], // no zone reads as UTC (v0.4.1)
   ['DUE 20/11/2026 09:00', { outcome: 'running', text: '' }],
   ['DUE 9', { outcome: 'running', text: '' }],
   ['DUE 2026-11-20T09:00:00Z - reminder to call', { outcome: 'due', text: '', dueAt: Z }],
