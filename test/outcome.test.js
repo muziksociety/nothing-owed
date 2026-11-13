@@ -14,9 +14,9 @@ test('parseOutcome: STILL_RUNNING variants', () => {
   }
 });
 
-test('parseOutcome: anything else is delivered', () => {
-  assert.equal(parseOutcome('Nothing owed, but here is a note'), 'deliver');
-  assert.equal(parseOutcome('NOTHING_OWED except the summary: ...'), 'deliver');
+test('parseOutcome: a short reply that mentions NOTHING_OWED is nothing; other text is delivered', () => {
+  assert.equal(parseOutcome('Nothing owed, but here is a note'), 'nothing');
+  assert.equal(parseOutcome('NOTHING_OWED except the summary: ...'), 'nothing');
   assert.equal(parseOutcome('Here is the summary.'), 'deliver');
 });
 
@@ -48,5 +48,5 @@ test('buildPrompt: last check swaps STILL_RUNNING for a one-line status', () => 
 test('buildPrompt: custom user label and clipped texts', () => {
   const p = buildPrompt({ replies: [{ at: 0, text: 'y'.repeat(50) }], userLabel: 'the customer', maxTextLength: 10 });
   assert.match(p, /reached the customer\./);
-  assert.match(p, /"yyyyyyyyy…"/);
+  assert.match(p, /"yyyyy … yyyyy"/);
 });
