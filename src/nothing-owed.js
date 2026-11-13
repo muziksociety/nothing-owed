@@ -556,7 +556,9 @@ export function createNothingOwed(options = {}) {
     if (permanent || item.attempts >= maxDeliveryAttempts) {
       outbox = outbox.filter((o) => o !== item);
       const t = now();
-      (missed[item.conversationId] ||= []).push({ text: item.text, at: t, due: permanent ? Infinity : t + missedRetryMs, wait: missedRetryMs });
+      // jobId and kind (job reports only) let noteJobUserNotified drop it; older entries have neither
+      const job = item.jobId != null ? { jobId: item.jobId, kind: item.kind } : {};
+      (missed[item.conversationId] ||= []).push({ text: item.text, at: t, due: permanent ? Infinity : t + missedRetryMs, wait: missedRetryMs, ...job });
       emit({ type: 'delivery_failed', ...outboxIds(item), attempts: item.attempts, permanent, error });
       return;
     }
@@ -1220,6 +1222,14 @@ export function createNothingOwed(options = {}) {
         if (o.sending) { o.userNotified = true; continue; } // dropped before its deliver()
         outbox = outbox.filter((x) => x !== o);
         emitDropped(o);
+      }
+      for (const [cid, list] of Object.entries(missed)) {
+        const gone = (list || []).filter((m) => m.jobId === id && (m.kind === 'report' || m.kind === 'fallback'));
+        if (!gone.length) continue;
+        found = true;
+        missed[cid] = list.filter((m) => !gone.includes(m));
+        if (!missed[cid].length) delete missed[cid];
+        for (const m of gone) emitDropped({ conversationId: cid, jobId: id, kind: m.kind });
       }
       if (found) { void save(); arm(); }
       return found;

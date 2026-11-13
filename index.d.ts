@@ -129,6 +129,9 @@ export interface MissedNotice {
   /** Next attempt (15 min after the give-up, doubling to 6 h). */
   due: number;
   wait: number;
+  /** v0.5.1+, job reports only: the job and kind, so noteJobUserNotified can drop it. Older entries have neither. */
+  jobId?: string;
+  kind?: 'report' | 'fallback';
 }
 
 /** What a store holds. v0.1 stores held a plain CheckRecord[]; that and v0.2/v0.3 objects still load. */

@@ -308,3 +308,26 @@ test('finishJob userNotified emits report_done like every other report path', as
   assert.deepEqual(order, ['job_finished', 'report_skipped', 'report_done']);
   assert.deepEqual(ev(w, 'report_done').map((e) => [e.conversationId, e.jobId]), [[C, 'j']]);
 });
+
+test('noteJobUserNotified drops a missed notice of that job; other missed notices stay', async () => {
+  const w = world({ reply: 'The render failed.' });
+  w.no = w.make({ delayMs: FIVE, isPermanentError: () => true, deliver: async () => { throw new Error('gone'); } });
+  await w.no.start();
+  w.no.trackJob(C, 'j');
+  await w.no.finishJob('j', { status: 'error', text: 'x' });
+  await w.no.idle();
+  assert.equal(w.no.missed().length, 1, 'the report became a missed notice');
+  assert.equal(w.no.noteJobUserNotified('j'), true);
+  assert.deepEqual(w.no.missed(), []);
+  assert.deepEqual(w.no.flushMissed(C), []);
+  assert.deepEqual(ev(w, 'report_dropped').map((e) => [e.jobId, e.kind]), [['j', 'report']]);
+});
+
+test('missed notices stored without a jobId (before v0.5.1) still load and are never dropped by a job', async () => {
+  const t = 1_700_000_000_000;
+  const store = createMemoryStore({ version: 4, records: [], missed: { [C]: [{ text: 'old text', at: t, due: Infinity, wait: 15 * MIN }] } });
+  const w = await five({ store });
+  assert.deepEqual(w.no.missed().map((m) => m.text), ['old text']);
+  assert.equal(w.no.noteJobUserNotified('j'), false);
+  assert.deepEqual(w.no.flushMissed(C), ['Missed: old text']);
+});
