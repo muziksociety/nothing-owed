@@ -1031,7 +1031,8 @@ export function createNothingOwed(options = {}) {
         return await reportDone(rep);
       }
 
-      if (outcome === 'due' && validDue(dueAt)) {
+      // a report the host already covered is dropped below: it must not come back as a dated check
+      if (outcome === 'due' && validDue(dueAt) && !rep.userNotified) {
         addDated({ conversationId: cid, replies: [{ at: now(), text: clipText(body || fallbackReportText(job, S), maxTextLength), seq: counters[cid] }], depth: 0 }, dueAt);
       }
       const carries = (outcome === 'deliver' || outcome === 'deliver_running' || outcome === 'due') && body;

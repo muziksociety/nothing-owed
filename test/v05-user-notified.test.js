@@ -258,3 +258,21 @@ test('deliver() fails after noteJobUserNotified: no outbox retry, one report_dro
   assert.deepEqual(ev(w, 'report_dropped').map((e) => [e.jobId, e.kind]), [['j', 'report']]);
   assert.ok(!w.types().includes('delivery_retry'));
 });
+
+// ---- v0.5.1 ------------------------------------------------------------------------------------
+
+test('a report dropped for userNotified never becomes a DUE dated check', async () => {
+  let release;
+  const w = await five({ reply: () => new Promise((r) => { release = r; }) });
+  w.no.trackJob(C, 'j', { title: 'render' });
+  await w.no.finishJob('j', { status: 'error', text: 'disk full' });
+  await new Promise((r) => setImmediate(r));
+  w.no.noteJobUserNotified('j');
+  const due = new Date(w.t + 24 * 60 * MIN).toISOString().slice(0, 19) + 'Z';
+  release(`The render failed; I will try again tomorrow.\nDUE ${due}`);
+  await w.no.idle();
+  assert.deepEqual(texts(w), []);
+  assert.deepEqual(w.no.dated(), [], 'no dated check holds the dropped text');
+  await w.advance(25 * 60 * MIN);
+  assert.deepEqual(texts(w), []);
+});
