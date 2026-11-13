@@ -299,7 +299,8 @@ export function createNothingOwed(options = {}) {
     while (waiters.length && active + woken < slots()) { woken++; waiters.shift()(true); }
   };
   const gate = () => {
-    if (!waiters.length && active + woken < slots()) return Promise.resolve(false);
+    // a pass is counted at once (woken), so passes granted before anyone takes a slot never overshoot
+    if (!waiters.length && active + woken < slots()) { woken++; return Promise.resolve(true); }
     return new Promise((resolve) => { waiters.push(resolve); pump(); });
   };
   const release = () => { active--; pump(); };
@@ -538,12 +539,17 @@ export function createNothingOwed(options = {}) {
     return sent.ok;
   };
 
-  const capLine = async (cid, ids) => {
+  // The limit lines (daily cap, verify cap, DUE limit) go at most once per conversation per day each.
+  const onceADay = (cid, reason) => {
     const day = Math.floor(now() / DAY_MS);
     const n = (notices[cid] ||= {});
-    if (n.capDay === day) return;
-    n.capDay = day;
-    await sendLine(cid, 'daily_cap', ids, { until: nextDay() });
+    const key = `${reason}Day`;
+    if (n[key] === day) return false;
+    n[key] = day;
+    return true;
+  };
+  const capLine = async (cid, ids) => {
+    if (onceADay(cid, 'daily_cap')) await sendLine(cid, 'daily_cap', ids, { until: nextDay() });
   };
 
   // An exact copy is not sent twice. Checks compare with copies delivered after the record's
@@ -587,7 +593,7 @@ export function createNothingOwed(options = {}) {
   const scheduleVerify = (cid, text, depth, at, dueDepth = 0, runAt) => {
     if (depth > maxVerifyDepth) {
       emit({ type: 'verify_capped', conversationId: cid, depth });
-      void track(sendLine(cid, 'verify_capped').then(() => save()));
+      if (onceADay(cid, 'verify_capped')) void track(sendLine(cid, 'verify_capped').then(() => save()));
       return null;
     }
     const t = at ?? now();
@@ -621,7 +627,7 @@ export function createNothingOwed(options = {}) {
     const count = records.filter((r) => r.conversationId === cid && r.state === 'dated').length;
     if (dueDepth > maxDueDepth || count >= maxDatedPerConversation) {
       emit({ type: 'due_limit', conversationId: cid, checkId: rec.id ?? null, dueDepth, dated: count });
-      void track(sendLine(cid, 'due_limit', { checkId: rec.id ?? null }).then(() => save()));
+      if (onceADay(cid, 'due_limit')) void track(sendLine(cid, 'due_limit', { checkId: rec.id ?? null }).then(() => save()));
       return false;
     }
     const d = { id: newId('due', now()), conversationId: cid, state: 'dated', kind: 'due', due: dueAt, dueAt, replies: rec.replies.slice(), rechecks: 0, depth: rec.depth || 0, dueDepth };
@@ -801,8 +807,9 @@ export function createNothingOwed(options = {}) {
         }
         if (carries && body) {
           sent = await deliverOwed(cid, body, { kind: 'check', checkId: rec.id, depth: rec.depth || 0, dueDepth: rec.dueDepth || 0 });
-          // A last-check status says the work is no longer watched: no verify after it.
-          if (sent.ok && !isLastCheck) verifies.push([body, (rec.depth || 0) + 1]);
+          // No verify after a last-check status (it says the work is no longer watched), nor after
+          // a delivery that also set a DUE timer (the timer is the follow-up).
+          if (sent.ok && !isLastCheck && outcome !== 'due') verifies.push([body, (rec.depth || 0) + 1]);
         }
         if (outcome === 'due') {
           datedAt = dueAt;

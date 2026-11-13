@@ -464,3 +464,25 @@ test('isUserBusy true for over 30 minutes emits busy_stuck once and keeps waitin
   assert.equal(w.turns.length, 0);
   assert.equal(w.events.filter((e) => e.type === 'busy_stuck').length, 1);
 });
+
+test('content + DUE every few minutes: one linear chain, bounded messages, each limit line once a day', async () => {
+  let n = 0;
+  const w = await five();
+  w.reply = () => `Reminder ${++n}: I'll check again shortly.\nDUE ${new Date(w.t + 7 * MIN).toISOString()}`;
+  w.no.noteReply(C, 'ok');
+  await steps(w, 24 * 60);
+  const reminders = texts(w).filter((t) => t.startsWith('Reminder'));
+  const lines = texts(w).filter((t) => !t.startsWith('Reminder'));
+  assert.ok(reminders.length <= 11, `reminders ${reminders.length}`);
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+});
+
+test('300 conversations due at once never run more than maxConcurrentLimit turns', async () => {
+  let live = 0;
+  let peak = 0;
+  const w = await five({ reply: async () => { live++; peak = Math.max(peak, live); await new Promise((r) => setTimeout(r, 5)); live--; return 'NOTHING_OWED'; } });
+  for (let i = 0; i < 300; i++) w.no.noteReply(`m${i}`, 'hi');
+  await w.advance(FIVE);
+  assert.equal(w.turns.length, 300);
+  assert.ok(peak <= 8, `peak ${peak}`);
+});
