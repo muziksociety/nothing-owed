@@ -187,6 +187,7 @@ export function createNothingOwed(options = {}) {
     userLabel = 'the user',
     timeZone,
     capDay = 'local',
+    capKey,
     promptLines,
     store = createMemoryStore(),
     runTurn,
@@ -235,6 +236,12 @@ export function createNothingOwed(options = {}) {
   const capZone = (cid) => (capDay === 'utc' ? undefined : zoneOf(cid));
   const globalZone = () => (capDay === 'utc' || typeof timeZone !== 'string' ? undefined : timeZone);
   const dayOf = (cid) => dayIn(now(), capZone(cid));
+  // capKey: conversations that share one dailyCap (for example every topic of one group chat).
+  // Default: each conversation its own. A throw or an empty key falls back to the conversation.
+  const capKeyOf = (cid) => {
+    if (typeof capKey !== 'function') return cid;
+    try { const k = capKey(cid); return k == null || k === '' ? cid : String(k); } catch { return cid; }
+  };
   const nextDay = (cid) => dayStartIn(dayOf(cid) + 1, capZone(cid));
   const nextGlobalDay = () => dayStartIn(dayIn(now(), globalZone()) + 1, globalZone());
 
@@ -436,8 +443,9 @@ export function createNothingOwed(options = {}) {
       return 'global';
     }
     const day = dayOf(cid);
-    let u = turnsByDay[cid];
-    if (!u || u.day !== day) u = turnsByDay[cid] = { day, n: 0 };
+    const key = capKeyOf(cid);
+    let u = turnsByDay[key];
+    if (!u || u.day !== day) u = turnsByDay[key] = { day, n: 0 };
     const limit = reason === 'window' || reason === 'due' ? dailyCap : Math.max(0, dailyCap - dailyCapReserve);
     if (dailyCap > 0 && u.n >= limit) return 'conv';
     u.n++;

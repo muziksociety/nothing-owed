@@ -428,6 +428,8 @@ export interface NothingOwedOptions {
    * none. 'utc': UTC days (the behaviour before 0.6.0).
    */
   capDay?: 'local' | 'utc';
+  /** Conversations that return the same key share one dailyCap (for example every topic of one group chat). Default: each conversation its own. A throw or an empty key means the conversation itself. */
+  capKey?(conversationId: string): string | null | undefined;
   /** Of dailyCap, this many are kept for window and dated checks. Default 10. */
   dailyCapReserve?: number;
   /** Model turns per day across all conversations; reaching it emits global_daily_cap once. Default 1000. 0 disables. */

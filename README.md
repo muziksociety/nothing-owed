@@ -305,6 +305,7 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 | `promptLanguage` | none | For example `'Spanish'`: the check and report prompts add "Write anything for the user in Spanish." The rest of the prompt stays English. |
 | `dailyCap` | `60` | Model turns per conversation per day (`0` disables). |
 | `capDay` | `'local'` | Which day the caps count: `'local'` (the conversation's `timeZone`, UTC when none) or `'utc'`. |
+| `capKey(id)` | each conversation | Conversations with the same key share one `dailyCap`, for example `(id) => id.split('\|')[0]` for all topics of one group. |
 | `promptLines(id, ctx)` | none | Extra lines for the check or report prompt (`ctx.kind`, `ctx.reason`); a string or a list. |
 | `onEvent(event)`, `onUsage(info)` | none | Every event (see `index.d.ts`), and turn usage or cost. |
 

@@ -210,6 +210,22 @@ test('4: capDay utc keeps the old UTC days', async () => {
   assert.equal(w.turns.length, 3, 'a new UTC day');
 });
 
+test('4 (0.6.1): capKey makes several conversations share one daily cap', async () => {
+  const w = await five({ dailyCap: 2, dailyCapReserve: 0, capKey: (cid) => cid.split('|')[0] });
+  for (const topic of ['group|1', 'group|2', 'group|3']) { w.no.noteReply(topic, `reply in ${topic}`); await w.advance(FIVE); }
+  assert.equal(w.turns.length, 2, 'the third topic is capped: the group shares one cap');
+  w.no.noteReply('dm', 'reply in the DM');
+  await w.advance(FIVE);
+  assert.equal(w.turns.length, 3, 'another key has its own cap');
+});
+
+test('4 (0.6.1): a capKey that throws or returns nothing falls back to the conversation', async () => {
+  const w = await five({ dailyCap: 1, dailyCapReserve: 0, capKey: (cid) => { if (cid === 'a') throw new Error('x'); return ''; } });
+  w.no.noteReply('a', 'one'); await w.advance(FIVE);
+  w.no.noteReply('b', 'two'); await w.advance(FIVE);
+  assert.equal(w.turns.length, 2);
+});
+
 // ---- 5. host lines in the prompt ---------------------------------------------------------------
 
 test('5: promptLines adds the host lines before the closing line, with the check context', async () => {
