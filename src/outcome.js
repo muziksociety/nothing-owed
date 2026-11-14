@@ -62,6 +62,8 @@ const list = (items, max, messageCount) =>
  * @param {'window'|'recheck'|'verify'|'due'|'park_timeout'} [input.reason] why this check runs
  * @param {number}  [input.dueAt]        on a dated check: the time the agent set
  * @param {string}  [input.language]     e.g. 'Spanish': adds "Write anything for the user in Spanish."
+ * @param {string[]} [input.hostLines]   lines from the host (its own queue, extra context), added
+ *   before the closing "Do not wait" line
  * @returns {string}
  */
 export function buildPrompt({
@@ -80,6 +82,7 @@ export function buildPrompt({
   reason,
   dueAt,
   language,
+  hostLines = [],
 }) {
   const u = userLabel;
   const lines = [`[Check from the system, not from ${u}.`];
@@ -125,8 +128,18 @@ export function buildPrompt({
     `If you owe nothing, or all of it is in the delivered list, reply with exactly ${NOTHING_OWED}.`,
   );
   if (language) lines.push(languageLine(u, language));
+  lines.push(...cleanLines(hostLines));
   lines.push(`Do not wait in this turn: no sleeping, no polling loops, no watching files or processes.]`);
   return lines.join('\n');
+}
+
+// Host lines: a string or a list of strings; blank lines dropped.
+export function cleanLines(v) {
+  const list = Array.isArray(v) ? v : v == null ? [] : [v];
+  return list
+    .flatMap((x) => String(x ?? '').split(/\r?\n/))
+    .map((x) => x.trimEnd())
+    .filter((x) => x.trim());
 }
 
 /**
@@ -138,9 +151,10 @@ export function buildPrompt({
  * @param {number} [input.maxTextLength] bound the job's output to this many characters (default 1500)
  * @param {{at:number,text:string}[]} [input.delivered] what reached the user since the job ended
  * @param {string} [input.language] e.g. 'Spanish': adds "Write anything for the user in Spanish."
+ * @param {string[]} [input.hostLines] lines from the host, added before the closing line
  * @returns {string}
  */
-export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40, language }) {
+export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40, language, hostLines = [] }) {
   const u = userLabel;
   const shown = delivered.slice(-Math.max(1, maxDelivered));
   return [
@@ -152,6 +166,7 @@ export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength =
     list(shown, 300, 0),
     `If those messages already give ${u} what it produced, reply with exactly ${NOTHING_OWED}.`,
     ...(language ? [languageLine(u, language)] : []),
+    ...cleanLines(hostLines),
     `Otherwise tell ${u} in a few lines what it produced and what is still open. No waiting in this turn.]`,
   ].join('\n');
 }

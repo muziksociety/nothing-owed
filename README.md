@@ -156,7 +156,7 @@ What the package sends through `deliver()` it counts and logs as delivered itsel
 
 ### Wiring
 
-Three lessons from putting the package into a real Telegram bot that sends rendered media to its users:
+Lessons from putting the package into real Telegram bots:
 
 - **Run your reply guards inside `deliver()`.** If your host filters or guards its own replies (for example, it blocks false "it's on its way" promises), the package's messages must pass the same guards: they reach the user through `deliver()`, not through your normal reply path. Return `{ text }` when a guard rewrote the text, and `{ skipped: true }` when it blocked it.
 - **Package messages are not normal replies.** Everything sent through `deliver()` carries `meta.kind` (`check`, `report`, `giveup`, `fallback` or `missed`). Do not treat these as a normal agent reply that can start actions. For example, if a check message ends with "shall I do it?" and the user answers "yes", that "yes" must not trigger work on its own: route it through a normal user turn, where the agent sees its history and decides.
@@ -177,6 +177,10 @@ Three lessons from putting the package into a real Telegram bot that sends rende
   ```
 
   If you only learn later that the user was told, call `noteJobUserNotified(jobId)`: a report still waiting is skipped, and one already being written, waiting for a retry, or kept as a missed notice is dropped before `deliver()` (event `report_dropped`). It returns `false` when nothing about the job is still open. `true` does not promise that nothing was sent: a text already inside `deliver()` when you call it still goes out. Called on a job that is still open, the flag is stored; if that job is then lost in a restart, its "interrupted by a restart" report is skipped too, since you said you would tell the user how it ended.
+- **Guard every send, not only the package's.** An agent sometimes ends a normal reply with a marker ("...all done.\n\nNOTHING_OWED"). Run every text your host sends through `cutMarkers(text)`: it cuts marker lines at the start and end, a marker glued to the first or last word, and a last `DUE` line, and turns a `STILL_RUNNING` left in the middle into the words "still running". It never drops a normal message; it returns `''` when only markers were left.
+- **Streamed replies: give them a `replyId`.** If you note a reply when its first part goes out and again when it is complete, pass the same `noteReply(id, text, { replyId })` both times: the second call replaces the first text and the reply is counted once. If the check already ran on the first part, the whole reply joins the next check.
+- **Long messages sent in chunks: save progress.** `deliver()` gets `meta.deliveryId` (the same for every attempt of that text, also after a restart), `meta.attempt`, and `meta.progress` with whatever you saved through `await meta.setProgress(data)` on an earlier attempt. Save the chunks already confirmed, and a retry sends only the rest. Progress is cleared when the delivery succeeds, is skipped or is given up.
+- **Your own context in the prompt.** `promptLines(id, ctx)` returns extra lines (for example reports your host will send anyway) that go into the check or report prompt before its closing line.
 
 Try it without an API key (a fake model on a virtual clock; every run prints exactly this):
 
@@ -278,8 +282,8 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 
 ## Caps and the circuit breaker
 
-- **Per conversation:** `dailyCap` (60) model turns per UTC day. The last `dailyCapReserve` (10) are kept for window checks (a new reply) and dated checks. Past the cap, the check waits for the next day and the user gets one line a day: *"I've hit today's limit for checking on promises; I'll check again at 00:00 UTC."* Reports past the cap use the code-written report.
-- **Overall:** `globalDailyCap` (1000) model turns per UTC day across all conversations; reaching it emits `global_daily_cap` once, for you.
+- **Per conversation:** `dailyCap` (60) model turns per day: the user's own day in the conversation's `timeZone` (UTC when none; `capDay: 'utc'` for UTC days always). The last `dailyCapReserve` (10) are kept for window checks (a new reply) and dated checks. Past the cap, the check waits for the next day and the user gets one line a day: *"I've hit today's limit for checking on promises; I'll check again at 00:00 UTC."* Reports past the cap use the code-written report.
+- **Overall:** `globalDailyCap` (1000) model turns per day across all conversations (in `timeZone` when it is a fixed string, else UTC); reaching it emits `global_daily_cap` once, for you.
 - **Circuit breaker:** after `circuitFailures` (5) failed turns in a row, across conversations, model turns pause for 15 minutes, then one probe turn runs; each failed probe doubles the pause up to 2 hours. `circuit_open` and `circuit_closed` events tell you. While it is open, give-up lines wait (so a broken setup does not tell every user something went wrong with a promise they never got), and due reports go out as their code-written version.
 - **Stuck busy:** if `isUserBusy` stays true for 30 minutes, you get one `busy_stuck` event; the check keeps waiting.
 
@@ -288,7 +292,7 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 | Option | Default | Meaning |
 |---|---|---|
 | `runTurn(id, prompt, ctx)` | required | Resume the same conversation's session with `prompt`; return the reply text, or `{ text, usage, costUsd }`. `ctx` has `kind`, `reason`, `isLastCheck` and an abort `signal`. Serialize it with user turns; it must not send anything itself. |
-| `deliver(id, text, meta)` | required | Send a package-made text. `meta` is `{ kind, checkId, jobId }`, kind `check`, `report`, `giveup`, `fallback` or `missed`. Throw if the send was not confirmed. |
+| `deliver(id, text, meta)` | required | Send a package-made text. `meta` is `{ kind, checkId, jobId, deliveryId, attempt, progress, setProgress }`, kind `check`, `report`, `giveup`, `fallback` or `missed`. Throw if the send was not confirmed. |
 | `store` | memory | `createFileStore(path)` (keeps the delivered log and a lock file next to it), `createMemoryStore()`, or any `{ load(), save(state) }`. |
 | `isUserBusy(id)` | none | `true` while the user is mid-conversation; checks and reports wait `busyRetryMs` and try again. |
 | `getDelivered(id, sinceMs)` | built-in log | Your own send log: `[{ at, text }]` for that conversation since `sinceMs`. |
@@ -299,7 +303,9 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 | `giveUpText(ctx)` | built-in lines | The code-written lines; `ctx.reason` is `failed`, `still_running`, `verify_capped`, `daily_cap` (with `until`) or `due_limit`. |
 | `strings` | English (`defaultStrings`) | Replace any user-visible string: `missedPrefix`, `fallbackReport` / `fallbackReportNoLine` templates (`{title}`, `{status}`, `{line}`), `status` words, `lostText`, and the `giveUp` lines (`daily_cap` fills `{time}` in UTC and `{localTime}` in the conversation's `timeZone`). A partial set keeps the other defaults; `giveUpText` still wins for the give-up lines. |
 | `promptLanguage` | none | For example `'Spanish'`: the check and report prompts add "Write anything for the user in Spanish." The rest of the prompt stays English. |
-| `dailyCap` | `60` | Model turns per conversation per UTC day (`0` disables). |
+| `dailyCap` | `60` | Model turns per conversation per day (`0` disables). |
+| `capDay` | `'local'` | Which day the caps count: `'local'` (the conversation's `timeZone`, UTC when none) or `'utc'`. |
+| `promptLines(id, ctx)` | none | Extra lines for the check or report prompt (`ctx.kind`, `ctx.reason`); a string or a list. |
 | `onEvent(event)`, `onUsage(info)` | none | Every event (see `index.d.ts`), and turn usage or cost. |
 
 <details>
@@ -333,11 +339,11 @@ After a give-up you get a `delivery_failed` event and the full text becomes a **
 
 </details>
 
-Methods: `noteReply(id, text, { kind? })`, `noteUserMessage(id)`, `messageCount(id)`, `noteDelivered(id, text, at | { at, id })`, `flushMissed(id)`, `isChecking(id)`, `trackJob(id, jobId, { title })`, `finishJob(jobId, { status, text, summary, userNotified })`, `wrapJob(id, jobId, promiseOrFn, { title, userNotifiedOnError })`, `noteJobUserNotified(jobId)`, `start()`, `stop()`, `flush()`, `tick()`, `idle()`, `pending()`, `parked()`, `dated()`, `jobs()`, `reports()`, `outbox()`, `missed()`, `circuit()`.
+Methods: `noteReply(id, text, { kind?, replyId? })`, `noteUserMessage(id)`, `messageCount(id)`, `noteDelivered(id, text, at | { at, id })`, `flushMissed(id)`, `isChecking(id)`, `trackJob(id, jobId, { title })`, `finishJob(jobId, { status, text, summary, userNotified })`, `wrapJob(id, jobId, promiseOrFn, { title, userNotifiedOnError })`, `noteJobUserNotified(jobId)`, `start()`, `stop()`, `flush()`, `tick()`, `idle()`, `pending()`, `parked()`, `dated()`, `jobs()`, `reports()`, `outbox()`, `missed()`, `circuit()`.
 
 `noteReply` kinds: none or `reply` opens or joins a window; `check` and `report` (replies you delivered yourself) count and get one verify check; `giveup`, `fallback` and `missed` only count; `system` does neither.
 
-Also exported: `buildPrompt()`, `buildReportPrompt()`, `parseOutcome()`, `parseCheckReply()`, `stripStillRunning()`, `clipText()`, `isJunkReply()`, `defaultGiveUpText(ctx, strings?)`, `fallbackReportText(job, strings?)`, `defaultStrings`, `createFileStore()`, `createMemoryStore()`, `createDeliveredLog()`, `NOTHING_OWED`, `STILL_RUNNING`. Types are in [`index.d.ts`](./index.d.ts).
+Also exported: `cutMarkers()` (the send guard), `stripMarkerLines()`, `dueOf()`, `dayIn()`, `dayStartIn()`, `buildPrompt()`, `buildReportPrompt()`, `parseOutcome()`, `parseCheckReply()`, `stripStillRunning()`, `clipText()`, `isJunkReply()`, `defaultGiveUpText(ctx, strings?)`, `fallbackReportText(job, strings?)`, `defaultStrings`, `createFileStore()`, `createMemoryStore()`, `createDeliveredLog()`, `NOTHING_OWED`, `STILL_RUNNING`. Types are in [`index.d.ts`](./index.d.ts).
 
 ## Adapters
 

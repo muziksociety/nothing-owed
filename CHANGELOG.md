@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-14
+
+Six gaps found while moving a second real host onto the package.
+
+### Added
+
+- `noteReply(id, text, { replyId })`: the same id noted again (a streamed reply: its start, then
+  the whole) replaces the earlier text instead of adding a second reply, and is counted once
+  (event `reply_updated`). If a check already ran on the earlier text, the whole reply joins the
+  next check. Reply ids are kept in the store.
+- `deliver()` meta now has `deliveryId` (the same for every attempt of that text, also after a
+  restart), `attempt`, `progress` and `setProgress(data)`: a host that sends long texts in chunks
+  saves the chunks already confirmed, and a retry sends only the rest. Progress is stored and
+  cleared when the delivery succeeds, is skipped or is given up.
+- `cutMarkers(text)`, the send guard, with `stripMarkerLines()` and `dueOf()`: run every text the
+  host sends through it so a marker never reaches the user. It never drops a normal message.
+- `promptLines(id, ctx)` option: host lines added to the check and report prompts before their
+  closing line (`buildPrompt` / `buildReportPrompt` take `hostLines`). A throw emits an `error`
+  event (stage `promptLines`) and the turn runs without them.
+- `dayIn()` and `dayStartIn()` helpers.
+
+### Changed
+
+- The daily caps and the once-a-day lines count the user's own day in the conversation's
+  `timeZone` (option `capDay`, default `'local'`). Without a `timeZone` nothing changes.
+  `capDay: 'utc'` keeps UTC days. The `daily_cap` event's `until` is the local midnight.
+- A `STILL_RUNNING` left in the middle of a text the send guard sees becomes the words
+  "still running" (marker lines at the start and end are cut).
+
 ## [0.5.2] - 2026-11-13
 
 ### Added

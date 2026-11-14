@@ -103,6 +103,18 @@ export interface DeliveryMeta {
   kind: DeliveryKind;
   checkId: string | null;
   jobId: string | null;
+  /** The same for every attempt of this delivery, also after a restart (kind, check or job, and a hash of the text). */
+  deliveryId: string;
+  /** 1 on the first attempt, then 2, 3, ... on retries. */
+  attempt: number;
+  /** What the host saved with setProgress on an earlier attempt of this delivery, else null. */
+  progress: unknown;
+  /**
+   * Save the host's progress on this delivery (for example the chunks already confirmed), so a
+   * retry, also after a restart, sends only the rest. JSON-serializable. Resolves when it is
+   * written to the store. Cleared when the delivery succeeds, is skipped or is given up.
+   */
+  setProgress(data: unknown): Promise<void>;
 }
 
 export interface OutboxItem {
@@ -228,6 +240,8 @@ type Ids = Array<string | number>;
 export type NothingOwedEvent =
   | { type: 'scheduled'; at: number; conversationId: string; checkId: string; due: number }
   | { type: 'merged'; at: number; conversationId: string; checkId: string; replies: number; due: number }
+  /** noteReply with a replyId already in the pending check: its text was replaced. */
+  | { type: 'reply_updated'; at: number; conversationId: string; checkId: string; replyId: string }
   | { type: 'verify_scheduled'; at: number; conversationId: string; checkId: string; depth: number; due: number }
   | { type: 'verify_capped'; at: number; conversationId: string; depth: number }
   | { type: 'dated'; at: number; conversationId: string; checkId: string; due: number }
@@ -267,7 +281,7 @@ export type NothingOwedEvent =
   | { type: 'delivery_failed'; at: number; conversationId: string; kind: DeliveryKind; checkId?: string; jobId?: string; attempts: number; permanent: boolean; error: unknown }
   | { type: 'missed_notice'; at: number; conversationId: string }
   | ({ type: 'usage'; at: number } & UsageInfo)
-  | { type: 'error'; at: number; stage: 'store' | 'check' | 'isUserBusy' | 'getDelivered' | 'report' | 'onJobFinished' | 'onStartJobs' | 'onTurnStart' | 'onTurnEnd' | 'deliver' | 'deliveredLog' | 'userNotifiedOnError'; conversationId?: string; checkId?: string; jobId?: string; error: unknown }
+  | { type: 'error'; at: number; stage: 'store' | 'check' | 'isUserBusy' | 'getDelivered' | 'report' | 'onJobFinished' | 'onStartJobs' | 'onTurnStart' | 'onTurnEnd' | 'deliver' | 'deliveredLog' | 'userNotifiedOnError' | 'promptLines'; conversationId?: string; checkId?: string; jobId?: string; error: unknown }
   | { type: 'started'; at: number; pending: number; parked: number; dated: number; jobs: number; lost: number; reports: number; outbox: number }
   | { type: 'stopped'; at: number };
 
@@ -324,6 +338,8 @@ export interface BuildPromptInput {
   dueAt?: number;
   /** e.g. 'Spanish': adds the line "Write anything for the user in Spanish." */
   language?: string;
+  /** Lines from the host (promptLines), added before the closing "Do not wait" line. Blank lines dropped. */
+  hostLines?: string | string[];
 }
 
 export interface BuildReportPromptInput {
@@ -336,6 +352,8 @@ export interface BuildReportPromptInput {
   maxTextLength?: number;
   /** e.g. 'Spanish': adds the line "Write anything for the user in Spanish." */
   language?: string;
+  /** Lines from the host (promptLines), added before the closing line. */
+  hostLines?: string | string[];
 }
 
 /**
@@ -402,11 +420,17 @@ export interface NothingOwedOptions {
   maxConcurrent?: number;
   /** The slot count grows by one per 25 waiting turns, up to this. Default 8. */
   maxConcurrentLimit?: number;
-  /** Model turns per conversation per UTC day; past it checks wait for the next day (one code-written line a day) and reports use the fallback line. Default 60. 0 disables. */
+  /** Model turns per conversation per day (see capDay); past it checks wait for the next day (one code-written line a day) and reports use the fallback line. Default 60. 0 disables. */
   dailyCap?: number;
+  /**
+   * Which day the daily caps and the once-a-day lines count. 'local' (default): the conversation's
+   * own day in its timeZone (the global cap: timeZone when it is a fixed string), UTC when there is
+   * none. 'utc': UTC days (the behaviour before 0.6.0).
+   */
+  capDay?: 'local' | 'utc';
   /** Of dailyCap, this many are kept for window and dated checks. Default 10. */
   dailyCapReserve?: number;
-  /** Model turns per UTC day across all conversations; reaching it emits global_daily_cap once. Default 1000. 0 disables. */
+  /** Model turns per day across all conversations; reaching it emits global_daily_cap once. Default 1000. 0 disables. */
   globalDailyCap?: number;
   /** Failed turns in a row (any conversation) that open the circuit breaker. Default 5. 0 disables. */
   circuitFailures?: number;
@@ -464,6 +488,13 @@ export interface NothingOwedOptions {
   strings?: NothingOwedStringsInput;
   /** e.g. 'Spanish': the check and report prompts add "Write anything for the user in Spanish." Default: none. */
   promptLanguage?: string;
+  /**
+   * Extra lines for a check or report prompt (for example your own queue of reports that will be
+   * sent anyway), added before its closing line. Called before each turn, while no turn slot is
+   * held; it times out like the other callbacks. A throw emits an error (stage promptLines) and the
+   * turn runs without them.
+   */
+  promptLines?(conversationId: string, ctx: { kind: 'check' | 'report'; checkId?: string; jobId?: string; reason: CheckReason | 'report'; recheck?: number }): string | string[] | null | undefined | Promise<string | string[] | null | undefined>;
   /** Your own send log. Omit it to use the built-in delivered log (noteDelivered). */
   getDelivered?(conversationId: string, sinceMs: number): TimedText[] | Promise<TimedText[]>;
   /** Return true while the user is mid-conversation; checks and report turns yield and retry. No turn slot is held while it runs. */
@@ -492,8 +523,11 @@ export interface NothingOwed {
    * The agent replied. Kinds 'check' and 'report' (replies you delivered yourself) count and get one
    * verify check; 'giveup', 'fallback' and 'missed' only count; 'system' does neither. A package
    * delivery routed back here is recognized and ignored. Returns the check it joined, or null.
+   * replyId (normal replies): the same id noted again (a streamed reply: its start, then the whole)
+   * replaces the earlier text instead of adding a reply, and is counted once. If a check already
+   * ran on the earlier text, the whole reply joins the next check.
    */
-  noteReply(conversationId: string, text: string, opts?: { kind?: 'reply' | DeliveryKind | 'system' | string; at?: number }): CheckRecord | null;
+  noteReply(conversationId: string, text: string, opts?: { kind?: 'reply' | DeliveryKind | 'system' | string; at?: number; replyId?: string | number }): CheckRecord | null;
   /** The user sent a message. Returns the conversation's message count. */
   noteUserMessage(conversationId: string): number;
   messageCount(conversationId: string): number;
@@ -548,6 +582,21 @@ export declare function clipText(text: string, max?: number): string;
 export declare function defaultGiveUpText(ctx: { reason?: GiveUpContext['reason']; until?: number; timeZone?: string }, strings?: NothingOwedStringsInput): string;
 /** The English defaults of every user-visible string (frozen). */
 export declare const defaultStrings: Readonly<NothingOwedStrings>;
+/**
+ * The send guard: run every text your host sends through it. Cuts NOTHING_OWED / STILL_RUNNING
+ * marker lines on the first two and last two lines, a marker glued to the start or end, and a last
+ * DUE line; a STILL_RUNNING left in the middle becomes "still running". Never drops a normal
+ * message. Returns '' when only markers were left.
+ */
+export declare function cutMarkers(text: string): string;
+/** Marker lines cut from the first two and last two non-empty lines; marker says if one was cut. */
+export declare function stripMarkerLines(text: string): { text: string; marker: boolean };
+/** A DUE line → its time in epoch ms, else null. */
+export declare function dueOf(line: string): number | null;
+/** The day number (days since 1970-01-01) of a time in an IANA zone; UTC when none or unknown. */
+export declare function dayIn(t: number, timeZone?: string): number;
+/** Epoch ms of the midnight that starts a day number in an IANA zone. */
+export declare function dayStartIn(day: number, timeZone?: string): number;
 /** True for tool-call markup returned as text: a line starting with "<｜", or "invoke name=", "<tool_call", "<function_calls>". */
 export declare function isJunkReply(text: string): boolean;
 /** "<title> <status>: <first line of output, 300 chars>" */

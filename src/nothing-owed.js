@@ -71,6 +71,49 @@ const localHhmm = (t, timeZone) => {
   } catch { return hhmm(t); }
 };
 
+// ---- days in a time zone (the daily cap counts the user's own day) ----------------------------
+
+const zoneFormats = new Map();
+const zoneFormat = (timeZone) => {
+  if (!zoneFormats.has(timeZone)) {
+    let f = null;
+    try {
+      f = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
+    } catch { f = null; } // unknown zone: UTC
+    zoneFormats.set(timeZone, f);
+  }
+  return zoneFormats.get(timeZone);
+};
+// The wall clock in the zone at `t`, read as if it were UTC (epoch ms); `t` itself for UTC.
+const wallClock = (t, timeZone) => {
+  const f = timeZone ? zoneFormat(timeZone) : null;
+  if (!f) return t;
+  const p = {};
+  for (const x of f.formatToParts(new Date(t))) p[x.type] = Number(x.value);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second);
+};
+/** The day number (days since 1970-01-01) of `t` in a time zone; the UTC day when none or unknown. */
+export const dayIn = (t, timeZone) => Math.floor(wallClock(t, timeZone) / DAY_MS);
+/** Epoch ms of the midnight that starts day number `day` in a time zone. */
+export const dayStartIn = (day, timeZone) => {
+  const target = day * DAY_MS;
+  let t = target;
+  for (let i = 0; i < 4; i++) {
+    const next = target - (wallClock(t, timeZone) - t);
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+};
+// A short stable hash of a text (FNV-1a, 32 bit, base 36): part of a delivery id.
+const hashText = (s) => {
+  let h = 0x811c9dc5;
+  const str = String(s ?? '');
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36);
+};
+const PROGRESS_KEEP_MS = 2 * DAY_MS;
+
 /**
  * The default code-written lines. `reason`: 'failed' (checks kept failing), 'still_running' (the
  * last check had nothing but STILL_RUNNING), 'verify_capped', 'daily_cap' (with `until`) or
@@ -143,6 +186,8 @@ export function createNothingOwed(options = {}) {
     saveDebounceMs = 100,
     userLabel = 'the user',
     timeZone,
+    capDay = 'local',
+    promptLines,
     store = createMemoryStore(),
     runTurn,
     deliver,
@@ -185,6 +230,13 @@ export function createNothingOwed(options = {}) {
     if (typeof timeZone !== 'function') return timeZone;
     try { return timeZone(cid) || undefined; } catch { return undefined; }
   };
+  // capDay 'local' (default): the daily caps and the once-a-day lines count the conversation's own
+  // day in its timeZone (the global cap: a fixed timeZone string, else UTC). 'utc': UTC days.
+  const capZone = (cid) => (capDay === 'utc' ? undefined : zoneOf(cid));
+  const globalZone = () => (capDay === 'utc' || typeof timeZone !== 'string' ? undefined : timeZone);
+  const dayOf = (cid) => dayIn(now(), capZone(cid));
+  const nextDay = (cid) => dayStartIn(dayOf(cid) + 1, capZone(cid));
+  const nextGlobalDay = () => dayStartIn(dayIn(now(), globalZone()) + 1, globalZone());
 
   const deliveredLog = options.deliveredLog || createDeliveredLog({ now, backing: store.deliveredBacking });
   const readDelivered = getDelivered || ((id, since) => deliveredLog.since(id, since));
@@ -202,6 +254,8 @@ export function createNothingOwed(options = {}) {
   let notices = {}; // conversationId -> { capDay, gaveUp }
   let circuit = { fails: 0, openUntil: 0, pauseMs: 0 };
   let lastActive = {}; // conversationId -> last activity time
+  let progress = {}; // deliveryId -> { conversationId, at, data } the host's progress on a delivery
+  let replyIds = {}; // conversationId -> recent reply ids already counted [{ id, at }]
   const lastHostReply = {}; // conversationId -> time of the last normal reply the host noted
   let timer = null;
   let started = false;
@@ -257,15 +311,23 @@ export function createNothingOwed(options = {}) {
       delete counters[cid];
       delete turnsByDay[cid];
       delete notices[cid];
+      delete replyIds[cid];
       own.delete(cid);
     }
-    const today = Math.floor(now() / DAY_MS);
+    // a local day is at most one day off the UTC day
+    const today = Math.floor(now() / DAY_MS) - 1;
     for (const [k, v] of Object.entries(turnsByDay)) if (v.day < today) delete turnsByDay[k];
+    const old = now() - PROGRESS_KEEP_MS;
+    for (const [k, v] of Object.entries(progress)) if (!(v?.at >= old)) delete progress[k];
+    for (const [k, list] of Object.entries(replyIds)) {
+      replyIds[k] = (list || []).filter((x) => x.at >= old);
+      if (!replyIds[k].length) delete replyIds[k];
+    }
   };
 
   const snapshot = () => {
     pruneIdle();
-    return copy({ version: STORE_VERSION, records, reports, counters, jobs, outbox, missed, turnsByDay, globalTurns, notices, circuit, lastActive });
+    return copy({ version: STORE_VERSION, records, reports, counters, jobs, outbox, missed, turnsByDay, globalTurns, notices, circuit, lastActive, progress, replyIds });
   };
 
   let saveTimer = null;
@@ -365,15 +427,15 @@ export function createNothingOwed(options = {}) {
   };
   const release = () => { active--; pump(); };
 
-  const nextDay = () => (Math.floor(now() / DAY_MS) + 1) * DAY_MS;
   // null when the turn may run; 'conv' or 'global' when a cap is reached.
   const spendTurn = (cid, reason) => {
-    const day = Math.floor(now() / DAY_MS);
-    if (globalTurns.day !== day) globalTurns = { day, n: 0, told: false };
+    const gday = dayIn(now(), globalZone());
+    if (globalTurns.day !== gday) globalTurns = { day: gday, n: 0, told: false };
     if (globalDailyCap > 0 && globalTurns.n >= globalDailyCap) {
-      if (!globalTurns.told) { globalTurns.told = true; emit({ type: 'global_daily_cap', cap: globalDailyCap, until: nextDay() }); }
+      if (!globalTurns.told) { globalTurns.told = true; emit({ type: 'global_daily_cap', cap: globalDailyCap, until: nextGlobalDay() }); }
       return 'global';
     }
+    const day = dayOf(cid);
     let u = turnsByDay[cid];
     if (!u || u.day !== day) u = turnsByDay[cid] = { day, n: 0 };
     const limit = reason === 'window' || reason === 'due' ? dailyCap : Math.max(0, dailyCap - dailyCapReserve);
@@ -437,7 +499,7 @@ export function createNothingOwed(options = {}) {
 
   // The part of a check run that waits: busy user, host send log, a free slot. No slot is held
   // while a host callback runs. Resolves { busy } or { delivered } with a slot taken.
-  const waitForTurn = async (cid, rec) => {
+  const waitForTurn = async (cid, rec, ctx = {}) => {
     for (;;) {
       if (isUserBusy) {
         let busy;
@@ -458,6 +520,15 @@ export function createNothingOwed(options = {}) {
       }
       let hostDelivered = null;
       if (getDelivered && rec.since != null) hostDelivered = (await timed('getDelivered', () => getDelivered(cid, rec.since))) || [];
+      let hostLines = [];
+      if (typeof promptLines === 'function') {
+        try {
+          hostLines = (await timed('promptLines', () => promptLines(cid, { ...ctx }))) ?? [];
+        } catch (error) {
+          emit({ type: 'error', stage: 'promptLines', conversationId: cid, checkId: ctx.checkId ?? null, jobId: ctx.jobId ?? null, error });
+          hostLines = []; // the check still runs, without the host's lines
+        }
+      }
       const wasWoken = await gate();
       if (wasWoken) woken--;
       // a waiter the pump woke had a slot counted for it: it takes it (re-checking here could
@@ -466,7 +537,7 @@ export function createNothingOwed(options = {}) {
         active++;
         // the built-in log is read again now, synchronously, so the list is current
         const delivered = hostDelivered ?? (rec.since != null ? deliveredLog.since(cid, rec.since) : []);
-        return { delivered };
+        return { delivered, hostLines };
       }
     }
   };
@@ -487,16 +558,37 @@ export function createNothingOwed(options = {}) {
     return (own.get(cid) || []).some((e) => e.text === f && (!e.done || now() - e.at <= ECHO_MS));
   };
 
+  // A delivery's id: the same for every attempt of the same text from the same check or job, also
+  // across a restart (a check that runs again after a restart and writes the same text gets it too).
+  const deliveryIdOf = (cid, text, meta) => meta.deliveryId ?? `${meta.kind || 'text'}:${meta.checkId ?? meta.jobId ?? cid}:${hashText(text)}`;
+
   // One send. On success the package counts it and logs it in the built-in delivered log.
+  // The host gets the delivery's id, the attempt number and its own saved progress, so a send cut
+  // by an error or a restart can go on from where it stopped (for example chunk by chunk).
   const sendOnce = async (cid, text, meta) => {
     const e = ownAdd(cid, text, meta.jobId);
+    const deliveryId = deliveryIdOf(cid, text, meta);
+    const saved = progress[deliveryId]?.data;
+    const hostMeta = {
+      kind: meta.kind,
+      checkId: meta.checkId ?? null,
+      jobId: meta.jobId ?? null,
+      deliveryId,
+      attempt: meta.attempts ?? 1,
+      progress: saved != null ? copy(saved) : null,
+      setProgress: (data) => {
+        progress[deliveryId] = { conversationId: cid, at: now(), data: data == null ? null : copy(data) };
+        return writeNow();
+      },
+    };
     let res;
     try {
-      res = await timed('deliver', () => deliver(cid, text, { kind: meta.kind, checkId: meta.checkId ?? null, jobId: meta.jobId ?? null }));
+      res = await timed('deliver', () => deliver(cid, text, hostMeta));
     } catch (error) {
       ownDrop(cid, e);
       throw error;
     }
+    if (progress[deliveryId]) { delete progress[deliveryId]; void save(); }
     const r = res && typeof res === 'object' ? res : {};
     if (r.skipped === true) {
       // the host chose not to send it: nothing reached the user, nothing to log or verify
@@ -562,6 +654,7 @@ export function createNothingOwed(options = {}) {
     const permanent = (() => { try { return !!isPermanentError(error); } catch { return false; } })();
     if (permanent || item.attempts >= maxDeliveryAttempts) {
       outbox = outbox.filter((o) => o !== item);
+      delete progress[deliveryIdOf(item.conversationId, item.text, item)]; // the missed notice is a new send
       const t = now();
       // jobId and kind (job reports only) let noteJobUserNotified drop it; older entries have neither
       const job = item.jobId != null ? { jobId: item.jobId, kind: item.kind } : {};
@@ -624,7 +717,7 @@ export function createNothingOwed(options = {}) {
 
   // The limit lines (daily cap, verify cap, DUE limit) go at most once per conversation per day each.
   const onceADay = (cid, reason) => {
-    const day = Math.floor(now() / DAY_MS);
+    const day = dayOf(cid);
     const n = (notices[cid] ||= {});
     const key = `${reason}Day`;
     if (n[key] === day) return false;
@@ -632,7 +725,7 @@ export function createNothingOwed(options = {}) {
     return true;
   };
   const capLine = async (cid, ids) => {
-    if (onceADay(cid, 'daily_cap')) await sendLine(cid, 'daily_cap', ids, { until: nextDay() });
+    if (onceADay(cid, 'daily_cap')) await sendLine(cid, 'daily_cap', ids, { until: nextDay(cid) });
   };
 
   // An exact copy is not sent twice. Checks compare with copies delivered after the record's
@@ -776,12 +869,13 @@ export function createNothingOwed(options = {}) {
     const verifies = []; // [text, depth] for deliveries that landed
     let datedAt = null;
     let suppressed = false;
+    let capScope = null;
 
     const finish = async (outcome) => {
       records = records.filter((r) => r !== rec);
       const open = openJobIds(cid);
       if (outcome === 'busy' || outcome === 'capped') {
-        const later = outcome === 'busy' ? now() + busyRetryMs : nextDay();
+        const later = outcome === 'busy' ? now() + busyRetryMs : capScope === 'global' ? nextGlobalDay() : nextDay(cid);
         if (from === 'parked' || from === 'dated') records.push({ ...rec, state: from, due: later });
         else {
           requeue(rec, later, rechecks);
@@ -818,14 +912,16 @@ export function createNothingOwed(options = {}) {
     const free = () => { if (held) { held = false; release(); } };
     try {
       let delivered;
+      let hostLines = [];
       try {
-        const w = await waitForTurn(cid, rec);
+        const w = await waitForTurn(cid, rec, { kind: 'check', checkId: rec.id, reason, recheck: rechecks });
         if (w.busy) {
           emit({ type: 'yielded', conversationId: cid, checkId: rec.id });
           return await finish('busy');
         }
         held = true;
         delivered = w.delivered;
+        hostLines = w.hostLines || [];
       } catch (error) {
         emit({ type: 'error', stage: 'getDelivered', conversationId: cid, checkId: rec.id, error });
         emit({ type: 'failed', conversationId: cid, checkId: rec.id, recheck: rechecks + 1, ms: now() - t0 });
@@ -834,7 +930,8 @@ export function createNothingOwed(options = {}) {
       const capped = spendTurn(cid, reason);
       if (capped) {
         free();
-        emit({ type: 'daily_cap', conversationId: cid, checkId: rec.id, scope: capped, until: nextDay() });
+        capScope = capped;
+        emit({ type: 'daily_cap', conversationId: cid, checkId: rec.id, scope: capped, until: capped === 'global' ? nextGlobalDay() : nextDay(cid) });
         await capLine(cid, { checkId: rec.id });
         return await finish('capped');
       }
@@ -861,6 +958,7 @@ export function createNothingOwed(options = {}) {
           deliveredSince: horizon != null && rec.since < horizon ? horizon : undefined,
           isLastCheck, userLabel, maxTextLength, maxDelivered: maxDeliveredInPrompt,
           messageCount: counters[cid] || 0, now: now(), timeZone: zoneOf(cid), reason, dueAt: rec.dueAt, language: promptLanguage,
+          hostLines,
         });
         emit({ type: 'check_started', conversationId: cid, checkId: rec.id, replies: rec.replies.length, delivered: delivered.length, recheck: rechecks, isLastCheck, reason });
 
@@ -981,7 +1079,7 @@ export function createNothingOwed(options = {}) {
     let held = false;
     const free = () => { if (held) { held = false; release(); } };
     try {
-      const w = await waitForTurn(cid, rep).catch((error) => ({ error }));
+      const w = await waitForTurn(cid, rep, { kind: 'report', jobId: job.id, reason: 'report' }).catch((error) => ({ error }));
       if (w.busy || w.error) {
         if (w.error) emit({ type: 'error', stage: 'isUserBusy', conversationId: cid, jobId: job.id, error: w.error });
         rep.state = 'pending';
@@ -997,9 +1095,10 @@ export function createNothingOwed(options = {}) {
         free();
         return await skipNotified(rep);
       }
-      if (spendTurn(cid, 'report')) {
+      const capped = spendTurn(cid, 'report');
+      if (capped) {
         free();
-        emit({ type: 'daily_cap', conversationId: cid, checkId: null, jobId: job.id, until: nextDay() });
+        emit({ type: 'daily_cap', conversationId: cid, checkId: null, jobId: job.id, scope: capped, until: capped === 'global' ? nextGlobalDay() : nextDay(cid) });
         await reportFallback(rep, 'capped');
         return await reportDone(rep);
       }
@@ -1009,7 +1108,7 @@ export function createNothingOwed(options = {}) {
       let body = '';
       let dueAt;
       try {
-        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt, language: promptLanguage });
+        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt, language: promptLanguage, hostLines: w.hostLines || [] });
         let res;
         try {
           res = await callTurn(cid, prompt, { kind: 'report', jobId: job.id, checkId: null, recheck: rep.attempts || 0, isLastCheck: false, reason: 'report' });
@@ -1078,11 +1177,37 @@ export function createNothingOwed(options = {}) {
      * and 'missed' only count; 'system' does neither. A package delivery routed back here is
      * recognized and ignored (it is already counted and verified).
      */
-    noteReply(conversationId, text, { kind, at } = {}) {
+    noteReply(conversationId, text, { kind, at, replyId } = {}) {
       const cid = String(conversationId);
       if (isEcho(cid, text)) return null;
       if (kind === 'system') return null;
-      count(cid);
+      const plain = !kind || (!CODE_KINDS.has(kind) && !VERIFY_KINDS.has(kind));
+      const rid = plain && replyId != null && replyId !== '' ? String(replyId) : null;
+      if (rid) {
+        // The same reply noted again (a streamed reply: its start, then the whole): it replaces
+        // the earlier text and is not counted twice.
+        const clipped = clipText(text, maxTextLength);
+        const pend = find(cid, 'pending');
+        const hit = pend?.replies.find((x) => x.replyId === rid);
+        if (hit) {
+          hit.text = clipped;
+          lastHostReply[cid] = at ?? now();
+          touch(cid);
+          emit({ type: 'reply_updated', conversationId: cid, checkId: pend.id, replyId: rid });
+          void save();
+          return recCopy(pend);
+        }
+        const known = (replyIds[cid] || []).some((x) => x.id === rid);
+        // a check already ran (or runs, or waits) on the earlier text: update it there, and the
+        // whole reply joins the next check below
+        for (const r of records) for (const x of r.replies) if (x.replyId === rid) x.text = clipped;
+        if (known) touch(cid);
+        else {
+          count(cid);
+          (replyIds[cid] ||= []).push({ id: rid, at: now() });
+          if (replyIds[cid].length > 50) replyIds[cid].shift();
+        }
+      } else count(cid);
       if (kind && CODE_KINDS.has(kind)) { void save(); return null; }
       if (kind && VERIFY_KINDS.has(kind)) {
         const rec = scheduleVerify(cid, text, 1, at);
@@ -1092,7 +1217,7 @@ export function createNothingOwed(options = {}) {
       }
       const t = at ?? now();
       lastHostReply[cid] = t;
-      const reply = { at: t, text: clipText(text, maxTextLength), seq: counters[cid] };
+      const reply = { at: t, text: clipText(text, maxTextLength), seq: counters[cid], ...(rid ? { replyId: rid } : {}) };
       let rec = find(cid, 'pending');
       if (rec) {
         rec.replies = keepFirst([...rec.replies, reply]);
@@ -1296,6 +1421,11 @@ export function createNothingOwed(options = {}) {
       for (const [k, v] of Object.entries(state.notices || {})) notices[k] = { ...v, ...(notices[k] || {}) };
       if (state.globalTurns) globalTurns = state.globalTurns;
       if (state.circuit) circuit = state.circuit;
+      for (const [k, v] of Object.entries(state.progress || {})) if (!progress[k]) progress[k] = v;
+      for (const [k, v] of Object.entries(state.replyIds || {})) {
+        const ids = new Set((replyIds[k] || []).map((x) => x.id));
+        replyIds[k] = [...(Array.isArray(v) ? v : []).filter((x) => x && !ids.has(x.id)), ...(replyIds[k] || [])];
+      }
       const seenOut = new Set(outbox.map((o) => o.id));
       for (const o of state.outbox || []) if (!seenOut.has(o.id)) outbox.push({ ...o, sending: undefined });
       const seenRep = new Set(reports.map((p) => p.id));
