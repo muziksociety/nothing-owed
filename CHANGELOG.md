@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] - 2026-11-14
+
+### Added
+
+- `canSendFiles` option (default `false`). With `true` the check prompt tells the agent to send an
+  owed file now with its file tool.
+
+### Fixed
+
+- An owed file no longer gets an empty promise. The check prompt used to say "say in one line that it
+  will be sent again and end with STILL_RUNNING", but nothing sent it later, so each check repeated
+  the promise. Without `canSendFiles` the agent now tells the user where the file is and promises
+  nothing.
+
 ## [0.6.1] - 2026-11-14
 
 ### Added

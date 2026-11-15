@@ -203,6 +203,7 @@ export function createNothingOwed(options = {}) {
     giveUpText,
     strings: stringsOpt,
     promptLanguage,
+    canSendFiles = false,
     onEvent = noop,
     onUsage,
     failTexts = [],
@@ -966,7 +967,7 @@ export function createNothingOwed(options = {}) {
           deliveredSince: horizon != null && rec.since < horizon ? horizon : undefined,
           isLastCheck, userLabel, maxTextLength, maxDelivered: maxDeliveredInPrompt,
           messageCount: counters[cid] || 0, now: now(), timeZone: zoneOf(cid), reason, dueAt: rec.dueAt, language: promptLanguage,
-          hostLines,
+          hostLines, canSendFiles,
         });
         emit({ type: 'check_started', conversationId: cid, checkId: rec.id, replies: rec.replies.length, delivered: delivered.length, recheck: rechecks, isLastCheck, reason });
 

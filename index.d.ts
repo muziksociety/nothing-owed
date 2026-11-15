@@ -338,6 +338,8 @@ export interface BuildPromptInput {
   dueAt?: number;
   /** e.g. 'Spanish': adds the line "Write anything for the user in Spanish." */
   language?: string;
+  /** See NothingOwedOptions.canSendFiles. */
+  canSendFiles?: boolean;
   /** Lines from the host (promptLines), added before the closing "Do not wait" line. Blank lines dropped. */
   hostLines?: string | string[];
 }
@@ -490,6 +492,8 @@ export interface NothingOwedOptions {
   strings?: NothingOwedStringsInput;
   /** e.g. 'Spanish': the check and report prompts add "Write anything for the user in Spanish." Default: none. */
   promptLanguage?: string;
+  /** True when your check turns have a tool that sends files: an owed file is sent in the check. Default false: the agent points the user at the file and promises nothing. */
+  canSendFiles?: boolean;
   /**
    * Extra lines for a check or report prompt (for example your own queue of reports that will be
    * sent anyway), added before its closing line. Called before each turn, while no turn slot is

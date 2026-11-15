@@ -64,6 +64,8 @@ const list = (items, max, messageCount) =>
  * @param {string}  [input.language]     e.g. 'Spanish': adds "Write anything for the user in Spanish."
  * @param {string[]} [input.hostLines]   lines from the host (its own queue, extra context), added
  *   before the closing "Do not wait" line
+ * @param {boolean} [input.canSendFiles] true when the check turn has a tool that sends files: an owed
+ *   file is sent now. Default false: the agent points the user at the file and promises nothing.
  * @returns {string}
  */
 export function buildPrompt({
@@ -83,6 +85,7 @@ export function buildPrompt({
   dueAt,
   language,
   hostLines = [],
+  canSendFiles = false,
 }) {
   const u = userLabel;
   const lines = [`[Check from the system, not from ${u}.`];
@@ -111,7 +114,9 @@ export function buildPrompt({
   }
   lines.push(
     `Only what is in this delivered list reached ${u}. Anything you wrote that is not in it, they never saw. Never say something was sent unless it is in this list.`,
-    `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. This turn cannot send files: if a file is owed, say in one line that it will be sent again and end with ${STILL_RUNNING}, or describe what it holds. Never pretend to attach anything.`,
+    canSendFiles
+      ? `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. If a file is owed, send it now with your file tool, to this conversation; it counts as sent only once it shows in the delivered list. Never pretend to attach anything.`
+      : `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. This turn cannot send files: if a file is owed, tell ${u} in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn. Never pretend to attach anything.`,
     `If you promised ${u} anything that is not in the delivered list, deliver it now, in full.`,
     `Background work you said will report back on its own stays owed until its report is in the delivered list.`,
   );
