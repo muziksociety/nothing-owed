@@ -114,9 +114,9 @@ export function buildPrompt({
   }
   lines.push(
     `Only what is in this delivered list reached ${u}. Anything you wrote that is not in it, they never saw. Never say something was sent unless it is in this list.`,
-    canSendFiles
-      ? `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. If a file is owed, send it now with your file tool, to this conversation; it counts as sent only once it shows in the delivered list. Never pretend to attach anything.`
-      : `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. This turn cannot send files: if a file is owed, tell ${u} in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn. Never pretend to attach anything.`,
+    `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. ${canSendFiles
+      ? 'If a file is owed, send it now with your file tool, to this conversation; it counts as sent only once it shows in the delivered list.'
+      : `This turn cannot send files: if a file is owed, tell ${u} in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn.`} Never pretend to attach anything.`,
     `If you promised ${u} anything that is not in the delivered list, deliver it now, in full.`,
     `Background work you said will report back on its own stays owed until its report is in the delivered list.`,
   );

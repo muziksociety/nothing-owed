@@ -41,3 +41,14 @@ test('without canSendFiles the check prompt keeps the no-files line', async () =
   await w.advance(5 * MIN);
   assert.match(w.turns[0].prompt, /This turn cannot send files/);
 });
+
+// Pinned text of the files line (untangle 2026-11-14): both branches, character for character.
+test('files line, canSendFiles true: exact text', () => {
+  const p = buildPrompt({ ...base, canSendFiles: true });
+  assert.ok(p.includes('Entries like [photo], [document: name] or [voice] mean that file reached the user. If a file is owed, send it now with your file tool, to this conversation; it counts as sent only once it shows in the delivered list. Never pretend to attach anything.\n'));
+});
+
+test('files line, default: exact text', () => {
+  const p = buildPrompt(base);
+  assert.ok(p.includes('Entries like [photo], [document: name] or [voice] mean that file reached the user. This turn cannot send files: if a file is owed, tell the user in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn. Never pretend to attach anything.\n'));
+});
