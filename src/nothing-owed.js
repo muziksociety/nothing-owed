@@ -551,6 +551,18 @@ export function createNothingOwed(options = {}) {
     }
   };
 
+  // Can this conversation's check or report turn send files? A boolean for every conversation, or a
+  // function of the conversation id. A function that throws: an error event, and no file sending.
+  const sendsFiles = (cid, ids = {}) => {
+    if (typeof canSendFiles !== 'function') return !!canSendFiles;
+    try {
+      return !!canSendFiles(cid);
+    } catch (error) {
+      emit({ type: 'error', stage: 'canSendFiles', conversationId: cid, checkId: ids.checkId ?? null, jobId: ids.jobId ?? null, error });
+      return false;
+    }
+  };
+
   // ---- delivery with retry ----------------------------------------------------------------
 
   const ownAdd = (cid, text, jobId) => {
@@ -967,7 +979,7 @@ export function createNothingOwed(options = {}) {
           deliveredSince: horizon != null && rec.since < horizon ? horizon : undefined,
           isLastCheck, userLabel, maxTextLength, maxDelivered: maxDeliveredInPrompt,
           messageCount: counters[cid] || 0, now: now(), timeZone: zoneOf(cid), reason, dueAt: rec.dueAt, language: promptLanguage,
-          hostLines, canSendFiles,
+          hostLines, canSendFiles: sendsFiles(cid, { checkId: rec.id }),
         });
         emit({ type: 'check_started', conversationId: cid, checkId: rec.id, replies: rec.replies.length, delivered: delivered.length, recheck: rechecks, isLastCheck, reason });
 
@@ -1117,7 +1129,7 @@ export function createNothingOwed(options = {}) {
       let body = '';
       let dueAt;
       try {
-        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt, language: promptLanguage, hostLines: w.hostLines || [] });
+        const prompt = buildReportPrompt({ job, userLabel, maxTextLength: maxReportLength, delivered: w.delivered || [], maxDelivered: maxDeliveredInPrompt, language: promptLanguage, hostLines: w.hostLines || [], canSendFiles: sendsFiles(cid, { jobId: job.id }) });
         let res;
         try {
           res = await callTurn(cid, prompt, { kind: 'report', jobId: job.id, checkId: null, recheck: rep.attempts || 0, isLastCheck: false, reason: 'report' });

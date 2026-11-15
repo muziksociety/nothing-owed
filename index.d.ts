@@ -356,6 +356,8 @@ export interface BuildReportPromptInput {
   language?: string;
   /** Lines from the host (promptLines), added before the closing line. */
   hostLines?: string | string[];
+  /** See NothingOwedOptions.canSendFiles (here already resolved for this conversation). */
+  canSendFiles?: boolean;
 }
 
 /**
@@ -492,8 +494,13 @@ export interface NothingOwedOptions {
   strings?: NothingOwedStringsInput;
   /** e.g. 'Spanish': the check and report prompts add "Write anything for the user in Spanish." Default: none. */
   promptLanguage?: string;
-  /** True when your check turns have a tool that sends files: an owed file is sent in the check. Default false: the agent points the user at the file and promises nothing. */
-  canSendFiles?: boolean;
+  /**
+   * True when your check and report turns have a tool that sends files: an owed file is sent in the
+   * turn. A function decides per conversation (for example false for conversations whose files do not
+   * show in the delivered list); if it throws, an error event (stage 'canSendFiles') and false.
+   * Default false: the agent points the user at the file and promises nothing.
+   */
+  canSendFiles?: boolean | ((conversationId: string) => boolean);
   /**
    * Extra lines for a check or report prompt (for example your own queue of reports that will be
    * sent anyway), added before its closing line. Called before each turn, while no turn slot is

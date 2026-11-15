@@ -114,9 +114,7 @@ export function buildPrompt({
   }
   lines.push(
     `Only what is in this delivered list reached ${u}. Anything you wrote that is not in it, they never saw. Never say something was sent unless it is in this list.`,
-    `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. ${canSendFiles
-      ? 'If a file is owed, send it now with your file tool, to this conversation; it counts as sent only once it shows in the delivered list.'
-      : `This turn cannot send files: if a file is owed, tell ${u} in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn.`} Never pretend to attach anything.`,
+    filesLine(u, canSendFiles),
     `If you promised ${u} anything that is not in the delivered list, deliver it now, in full.`,
     `Background work you said will report back on its own stays owed until its report is in the delivered list.`,
   );
@@ -159,7 +157,15 @@ export function cleanLines(v) {
  * @param {string[]} [input.hostLines] lines from the host, added before the closing line
  * @returns {string}
  */
-export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40, language, hostLines = [] }) {
+// How a file is handled in a check or report turn: sent now when the turn can send files, otherwise
+// pointed to, never promised (a promise from a turn that cannot send is never kept).
+export function filesLine(u, canSendFiles) {
+  return `Entries like [photo], [document: name] or [voice] mean that file reached ${u}. ${canSendFiles
+    ? 'If a file is owed, send it now with your file tool, to this conversation; it counts as sent only once it shows in the delivered list.'
+    : `This turn cannot send files: if a file is owed, tell ${u} in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn.`} Never pretend to attach anything.`;
+}
+
+export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength = 1500, delivered = [], maxDelivered = 40, language, hostLines = [], canSendFiles = false }) {
   const u = userLabel;
   const shown = delivered.slice(-Math.max(1, maxDelivered));
   return [
@@ -169,6 +175,7 @@ export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength =
     job.text ? clipText(job.text, maxTextLength) : '(no output)',
     `Messages the host delivered to ${u} since the job ended:`,
     list(shown, 300, 0),
+    filesLine(u, canSendFiles),
     `If those messages already give ${u} what it produced, reply with exactly ${NOTHING_OWED}.`,
     ...(language ? [languageLine(u, language)] : []),
     ...cleanLines(hostLines),

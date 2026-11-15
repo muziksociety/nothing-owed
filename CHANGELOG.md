@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] - 2026-11-14
+
+### Added
+
+- `canSendFiles` can be a function of the conversation id, so one instance can send files in some
+  conversations and not others. A function that throws gives an `error` event (stage
+  `canSendFiles`) and no file sending.
+
+### Fixed
+
+- The report prompt now has the same files line as the check prompt. A finished job that made a
+  file gets it sent (with `canSendFiles`) or pointed to, never promised.
+
 ## [0.6.2] - 2026-11-14
 
 ### Added
