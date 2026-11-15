@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4] - 2026-11-15
+
+### Fixed
+
+- A check reply "STILL_RUNNING. <note>" (a period, then a status note on the same line) is a marker
+  line, like "STILL_RUNNING - <note>": the check stays open and nothing is sent. Before, the user got
+  "Still running. <note>" on every recheck. NOTHING_OWED keeps its old rule.
+
 ## [0.6.3] - 2026-11-14
 
 ### Added

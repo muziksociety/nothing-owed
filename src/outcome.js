@@ -197,10 +197,12 @@ const decor = (line) =>
     .replace(/[`*_"'“”‘’.!?,;:\s\])}\p{Extended_Pictographic}\uFE0F\u200D]+$/u, '');
 
 // A marker line: the marker alone, an optional label before it ("Status:"), an optional short note
-// after it ("(render)", "- all delivered").
-const markerRe = (word) => new RegExp(`^(?:(?:status|answer|result|outcome|reply)\\s*:\\s*)?${word}\\s*(?:[([].*|[-–—:].*)?$`, 'i');
+// after it ("(render)", "- all delivered"). With `period`, also a period, a space and a note
+// ("STILL_RUNNING. The render is at 40%."). Not for NOTHING_OWED: "NOTHING_OWED. But I owe you X"
+// stays content.
+const markerRe = (word, period = false) => new RegExp(`^(?:(?:status|answer|result|outcome|reply)\\s*:\\s*)?${word}\\s*(?:[([].*|[-–—:].*${period ? '|\\.[*_`]*\\s.*' : ''})?$`, 'i');
 const NOTHING_LINE = markerRe('nothing[\\s_-]*owed');
-const RUNNING_LINE = markerRe('still[\\s_-]*running');
+const RUNNING_LINE = markerRe('still[\\s_-]*running', true);
 const NOTHING_TOKEN = /nothing_owed/i;
 const NOTHING_PHRASE = /\b(?:nothing[\s_-]+(?:is\s+)?owed|i\s+owe\s+nothing)\b/i;
 const LEADING_NOTHING = /^nothing[_ ]owed\b[\s,:;.]*(?:except(?:\s+for)?|but|apart\s+from|other\s+than|besides|however)\b[\s,:;]*/i;
