@@ -60,3 +60,9 @@ test('report turn gets canSendFiles from the option', async () => {
   assert.ok(report, 'a report turn ran');
   assert.match(report.prompt, SEND);
 });
+
+// Pinned (untangle 2026-11-14): the report prompt's files line sits right after the delivered list.
+test('report prompt: files line follows the delivered list, exact text', () => {
+  const p = buildReportPrompt({ job });
+  assert.ok(p.includes('(nothing)\nEntries like [photo], [document: name] or [voice] mean that file reached the user. This turn cannot send files: if a file is owed, tell the user in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn. Never pretend to attach anything.\nIf those messages already give'));
+});
