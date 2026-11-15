@@ -124,6 +124,7 @@ export function buildPrompt({
     lines.push(
       `If the only thing owed is such work and it is still running, reply with exactly ${STILL_RUNNING}; the check comes back later.`,
       `If you deliver something now but another promise is still running, put the line ${STILL_RUNNING} at the very end of your reply.`,
+      `Never write a note about work that is still running ("not done yet", "I'll pass it on when it lands"): ${STILL_RUNNING} says it, and any text with it is sent to the user.`,
     );
   }
   lines.push(

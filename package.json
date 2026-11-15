@@ -1,6 +1,6 @@
 {
   "name": "nothing-owed",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "A timer on every agent reply: the agent audits its own conversation against what really reached the user, and delivers what it still owes.",
   "license": "MIT",
   "author": "muziksociety",

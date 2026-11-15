@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.5] - 2026-11-15
+
+### Changed
+
+- The check prompt (not the last check) asks the agent never to write a note about work that is
+  still running: STILL_RUNNING says it, and text next to it is sent. The parser is unchanged, so a
+  short real update next to the marker is still delivered.
+
 ## [0.6.4] - 2026-11-15
 
 ### Fixed

@@ -22,3 +22,10 @@ test('parser: the period form does not touch other text', () => {
   assert.deepEqual(parseCheckReply('The render is STILL_RUNNING. Back soon.'), { outcome: 'deliver_running', text: 'The render is still running. Back soon.' });
   assert.equal(parseCheckReply('NOTHING_OWED. But I owe you the link: https://example.com/a').outcome, 'deliver', 'NOTHING_OWED keeps its old rule');
 });
+
+test('buildPrompt: a check that is not the last asks for no note about work that is still running', async () => {
+  const { buildPrompt, STILL_RUNNING } = await import('../src/index.js');
+  const line = `Never write a note about work that is still running ("not done yet", "I'll pass it on when it lands"): ${STILL_RUNNING} says it, and any text with it is sent to the user.`;
+  assert.ok(buildPrompt({ replies: [{ at: 0, text: 'x' }] }).includes(line));
+  assert.ok(!buildPrompt({ replies: [{ at: 0, text: 'x' }], isLastCheck: true }).includes(line), 'the last check asks for a one-line status instead');
+});
