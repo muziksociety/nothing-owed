@@ -582,6 +582,7 @@ export function createNothingOwed(options = {}) {
 
   // A delivery's id: the same for every attempt of the same text from the same check or job, also
   // across a restart (a check that runs again after a restart and writes the same text gets it too).
+  // Outbox items carry it from creation; older stored items without one fall back to the recompute.
   const deliveryIdOf = (cid, text, meta) => meta.deliveryId ?? `${meta.kind || 'text'}:${meta.checkId ?? meta.jobId ?? cid}:${hashText(text)}`;
 
   // One send. On success the package counts it and logs it in the built-in delivered log.
@@ -676,7 +677,7 @@ export function createNothingOwed(options = {}) {
     const permanent = (() => { try { return !!isPermanentError(error); } catch { return false; } })();
     if (permanent || item.attempts >= maxDeliveryAttempts) {
       outbox = outbox.filter((o) => o !== item);
-      delete progress[deliveryIdOf(item.conversationId, item.text, item)]; // the missed notice is a new send
+      delete progress[deliveryIdOf(item.conversationId, item.text, item)]; // the missed notice is a new send (item.deliveryId, or the recompute for older items)
       const t = now();
       // jobId and kind (job reports only) let noteJobUserNotified drop it; older entries have neither
       const job = item.jobId != null ? { jobId: item.jobId, kind: item.kind } : {};
@@ -699,7 +700,7 @@ export function createNothingOwed(options = {}) {
       return { ok: true, ids, text: sentText, skipped: !!skipped };
     } catch (error) {
       if (drop?.()) return { ok: false, dropped: true };
-      const item = { id: newId('out', now()), conversationId: cid, text, attempts: 1, due: 0, at: now(), ...meta };
+      const item = { id: newId('out', now()), conversationId: cid, text, attempts: 1, due: 0, at: now(), ...meta, deliveryId: deliveryIdOf(cid, text, meta) };
       failDelivery(item, error);
       return { ok: false };
     }
@@ -1614,7 +1615,7 @@ export function createNothingOwed(options = {}) {
 
     /** Copies of the deliveries waiting for a retry. */
     outbox() {
-      return outbox.map(({ sending, ...o }) => ({ ...o }));
+      return outbox.map(({ sending, deliveryId, ...o }) => ({ ...o }));
     },
 
     /** Copies of the owed "Missed:" notices: [{ conversationId, text, due }]. */
