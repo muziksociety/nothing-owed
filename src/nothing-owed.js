@@ -435,20 +435,21 @@ export function createNothingOwed(options = {}) {
   };
   const release = () => { active--; pump(); };
 
-  // null when the turn may run; 'conv' or 'global' when a cap is reached.
+  // null when the turn may run; { scope: 'conv' | 'global', until } when a cap is reached.
   const spendTurn = (cid, reason) => {
     const gday = dayIn(now(), globalZone());
     if (globalTurns.day !== gday) globalTurns = { day: gday, n: 0, told: false };
     if (globalDailyCap > 0 && globalTurns.n >= globalDailyCap) {
-      if (!globalTurns.told) { globalTurns.told = true; emit({ type: 'global_daily_cap', cap: globalDailyCap, until: nextGlobalDay() }); }
-      return 'global';
+      const until = nextGlobalDay();
+      if (!globalTurns.told) { globalTurns.told = true; emit({ type: 'global_daily_cap', cap: globalDailyCap, until }); }
+      return { scope: 'global', until };
     }
     const day = dayOf(cid);
     const key = capKeyOf(cid);
     let u = turnsByDay[key];
     if (!u || u.day !== day) u = turnsByDay[key] = { day, n: 0 };
     const limit = reason === 'window' || reason === 'due' ? dailyCap : Math.max(0, dailyCap - dailyCapReserve);
-    if (dailyCap > 0 && u.n >= limit) return 'conv';
+    if (dailyCap > 0 && u.n >= limit) return { scope: 'conv', until: nextDay(cid) };
     u.n++;
     globalTurns.n++;
     return null;
@@ -890,13 +891,13 @@ export function createNothingOwed(options = {}) {
     const verifies = []; // [text, depth] for deliveries that landed
     let datedAt = null;
     let suppressed = false;
-    let capScope = null;
+    let capUntil = null;
 
     const finish = async (outcome) => {
       records = records.filter((r) => r !== rec);
       const open = openJobIds(cid);
       if (outcome === 'busy' || outcome === 'capped') {
-        const later = outcome === 'busy' ? now() + busyRetryMs : capScope === 'global' ? nextGlobalDay() : nextDay(cid);
+        const later = outcome === 'busy' ? now() + busyRetryMs : capUntil;
         if (from === 'parked' || from === 'dated') records.push({ ...rec, state: from, due: later });
         else {
           requeue(rec, later, rechecks);
@@ -951,8 +952,8 @@ export function createNothingOwed(options = {}) {
       const capped = spendTurn(cid, reason);
       if (capped) {
         free();
-        capScope = capped;
-        emit({ type: 'daily_cap', conversationId: cid, checkId: rec.id, scope: capped, until: capped === 'global' ? nextGlobalDay() : nextDay(cid) });
+        capUntil = capped.until;
+        emit({ type: 'daily_cap', conversationId: cid, checkId: rec.id, scope: capped.scope, until: capped.until });
         await capLine(cid, { checkId: rec.id });
         return await finish('capped');
       }
@@ -1119,7 +1120,7 @@ export function createNothingOwed(options = {}) {
       const capped = spendTurn(cid, 'report');
       if (capped) {
         free();
-        emit({ type: 'daily_cap', conversationId: cid, checkId: null, jobId: job.id, scope: capped, until: capped === 'global' ? nextGlobalDay() : nextDay(cid) });
+        emit({ type: 'daily_cap', conversationId: cid, checkId: null, jobId: job.id, scope: capped.scope, until: capped.until });
         await reportFallback(rep, 'capped');
         return await reportDone(rep);
       }
