@@ -1191,6 +1191,35 @@ export function createNothingOwed(options = {}) {
     }
   }
 
+  // noteReply with a replyId. The same reply noted again (a streamed reply: its start, then the
+  // whole) replaces the earlier text and is not counted twice. Returns the pending check's copy
+  // when the reply was already in it (noteReply is done); otherwise undefined, and the whole reply
+  // joins the next check.
+  const noteReplyId = (cid, rid, text, at) => {
+    const clipped = clipText(text, maxTextLength);
+    const pend = find(cid, 'pending');
+    const hit = pend?.replies.find((x) => x.replyId === rid);
+    if (hit) {
+      hit.text = clipped;
+      lastHostReply[cid] = at ?? now();
+      touch(cid);
+      emit({ type: 'reply_updated', conversationId: cid, checkId: pend.id, replyId: rid });
+      void save();
+      return recCopy(pend);
+    }
+    const known = (replyIds[cid] || []).some((x) => x.id === rid);
+    // a check already ran (or runs, or waits) on the earlier text: update it there, and the
+    // whole reply joins the next check
+    for (const r of records) for (const x of r.replies) if (x.replyId === rid) x.text = clipped;
+    if (known) touch(cid);
+    else {
+      count(cid);
+      (replyIds[cid] ||= []).push({ id: rid, at: now() });
+      if (replyIds[cid].length > 50) replyIds[cid].shift();
+    }
+    return undefined;
+  };
+
   const api = {
     /**
      * The agent sent `text` to the user in `conversationId`. Opens that conversation's check
@@ -1207,29 +1236,8 @@ export function createNothingOwed(options = {}) {
       const plain = !kind || (!CODE_KINDS.has(kind) && !VERIFY_KINDS.has(kind));
       const rid = plain && replyId != null && replyId !== '' ? String(replyId) : null;
       if (rid) {
-        // The same reply noted again (a streamed reply: its start, then the whole): it replaces
-        // the earlier text and is not counted twice.
-        const clipped = clipText(text, maxTextLength);
-        const pend = find(cid, 'pending');
-        const hit = pend?.replies.find((x) => x.replyId === rid);
-        if (hit) {
-          hit.text = clipped;
-          lastHostReply[cid] = at ?? now();
-          touch(cid);
-          emit({ type: 'reply_updated', conversationId: cid, checkId: pend.id, replyId: rid });
-          void save();
-          return recCopy(pend);
-        }
-        const known = (replyIds[cid] || []).some((x) => x.id === rid);
-        // a check already ran (or runs, or waits) on the earlier text: update it there, and the
-        // whole reply joins the next check below
-        for (const r of records) for (const x of r.replies) if (x.replyId === rid) x.text = clipped;
-        if (known) touch(cid);
-        else {
-          count(cid);
-          (replyIds[cid] ||= []).push({ id: rid, at: now() });
-          if (replyIds[cid].length > 50) replyIds[cid].shift();
-        }
+        const updated = noteReplyId(cid, rid, text, at);
+        if (updated) return updated;
       } else count(cid);
       if (kind && CODE_KINDS.has(kind)) { void save(); return null; }
       if (kind && VERIFY_KINDS.has(kind)) {
