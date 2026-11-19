@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.6] - 2026-11-19
+
+### Changed
+
+- The check and report prompts say the delivered list is shortened for the prompt only: a
+  shortened entry is not a cut-off message, so the agent never sends "the rest" of it again.
+
+### Internal
+
+- spendTurn returns the cap scope and its end; outbox items store their delivery id at creation;
+  the noteReply replyId branch is a private helper. No change in behavior.
+
 ## [0.6.5] - 2026-11-15
 
 ### Changed

@@ -28,6 +28,9 @@ function nowLine(t, timeZone) {
   return `Now (UTC): ${iso(t)}.`;
 }
 
+// The lists in the prompts are clipped; without this the agent read a clipped entry as a cut-off
+// message and sent "the rest" again.
+const CLIP_NOTE = (max) => `Texts in these lists are shortened to about ${max} characters for this prompt only. A shortened entry is NOT a cut-off message: the full text reached the user. Never send "the rest" of a message because its entry here looks cut.`;
 const languageLine = (u, language) => `Write anything for ${u} in ${language}.`;
 const back = (n) => (n === 1 ? '1 message back' : `${n} messages back`);
 const hasSeq = (items) => items.some((x) => x.seq != null);
@@ -103,6 +106,7 @@ export function buildPrompt({
   lines.push(`Messages the host actually delivered to ${u} in this conversation since just before the first of those replies (from the host's send log):`);
   if (hidden) lines.push(`(${hidden} older not shown)`);
   lines.push(cap === 0 && hidden ? '' : list(shown, maxTextLength, 0));
+  lines.push(CLIP_NOTE(maxTextLength));
   if (deliveredSince != null) {
     lines.push(`This delivered list may be incomplete: the send log only reaches back to ${iso(deliveredSince)}. Do not send anything again unless you are sure ${u} never got it.`);
   }
@@ -176,6 +180,7 @@ export function buildReportPrompt({ job, userLabel = 'the user', maxTextLength =
     job.text ? clipText(job.text, maxTextLength) : '(no output)',
     `Messages the host delivered to ${u} since the job ended:`,
     list(shown, 300, 0),
+    CLIP_NOTE(300),
     filesLine(u, canSendFiles),
     `If those messages already give ${u} what it produced, reply with exactly ${NOTHING_OWED}.`,
     ...(language ? [languageLine(u, language)] : []),

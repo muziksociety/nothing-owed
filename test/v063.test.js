@@ -62,7 +62,8 @@ test('report turn gets canSendFiles from the option', async () => {
 });
 
 // Pinned (untangle 2026-11-14): the report prompt's files line sits right after the delivered list.
+// v0.6.6: the shortened-list note now sits between them (see v066.test.js).
 test('report prompt: files line follows the delivered list, exact text', () => {
   const p = buildReportPrompt({ job });
-  assert.ok(p.includes('(nothing)\nEntries like [photo], [document: name] or [voice] mean that file reached the user. This turn cannot send files: if a file is owed, tell the user in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn. Never pretend to attach anything.\nIf those messages already give'));
+  assert.ok(p.includes('(nothing)\nTexts in these lists are shortened to about 300 characters for this prompt only. A shortened entry is NOT a cut-off message: the full text reached the user. Never send "the rest" of a message because its entry here looks cut.\nEntries like [photo], [document: name] or [voice] mean that file reached the user. This turn cannot send files: if a file is owed, tell the user in one line where they can find it (a link, or the chat it went to), or describe what it holds. Do not promise to send it from this turn. Never pretend to attach anything.\nIf those messages already give'));
 });
